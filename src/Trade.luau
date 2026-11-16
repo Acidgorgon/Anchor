@@ -33,7 +33,9 @@
 
 	PROTOCOL (two-phase escrow, one neutral decision key per trade)
 		1. ONE tick, no yield: fn(draftA, draftB) on copies; diff -> each side's patch split into
-		   OUTGOING (Remove, Pull, negative Inc) and INCOMING (Set, Push, positive Inc). Outgoing
+		   OUTGOING (Remove, Pull, negative Inc; a Set that replaces an existing value also
+		   escrows it as Remove(path), refund Set(path, old)) and INCOMING (Set, Push, positive
+		   Inc). Outgoing
 		   is applied to both live profiles immediately and each side gets
 		   MetaData.Anchor.Tx[id] = {role, refund = inverse of outgoing, incoming, peer, t}.
 		   From here the traded items can't be spent, and every save of either side (autosave,
@@ -51,15 +53,18 @@
 		6. Before step 1's tick ends nothing is written; if either side's escrow or committed
 		   size estimate exceeds the limit the trade is refused ("TooBig"). Resolution onto
 		   changed data: missing parents are recreated; an Inc onto a non-number (or a write
-		   below a non-table) is never forced: the record is kept, OnError says NEEDS MANUAL
-		   REVIEW, and store:PendingTrades(profile) lists it.
+		   below a non-table, or a Set onto a non-nil, different value) is never forced: the
+		   record is kept, OnError says NEEDS MANUAL REVIEW, and store:PendingTrades(profile)
+		   lists it. A Set onto an equal value counts as applied.
 
 	While a trade commits, profile:IsTrading() is true and Data:Update(player, fn) waits for
 	it. Direct writes to profile.Data in that window (~1-2 saves) can still race.
 
 	Gifts ride the profile's message queue: the patch is applied when the owner processes the
 	message, and the stock "processed" removal lands in the same save as the data, so each
-	message applies exactly once. Gift patches never recreate a parent the player no longer
+	message applies exactly once. Each gift also carries an internal id; the receiver keeps
+	the last GIFT_RING (1000) applied ids in MetaData.Anchor.Gifts (count-bounded, never
+	time-pruned) and skips a redelivered id. Gift patches never recreate a parent the player no longer
 	has (a sold pet doesn't come back as a stub) unless the template defines it.
 
 	Live proxies: opts.Live = {liveA, liveB} (Ripple states wrapping profile.Data in place),
@@ -72,7 +77,8 @@ local ESCROW_SAVE_ATTEMPTS = 2
 local DECISION_STORE = "AnchorTx"
 local DECISION_WAIT = 10 -- (Seconds) Trade waits this long for the decision key before "Pending"
 local RETRY_MAX = 60
-local SIZE_LIMIT = 4000000 -- bytes; Roblox's limit is 4 MB per key, leave room for the envelope
+local SIZE_LIMIT = 4000000
+local GIFT_RING = 1000 -- gift ids remembered per profile (count-bounded, no time pruning) -- bytes; Roblox's limit is 4 MB per key, leave room for the envelope
 
 local Trade = {}
 
@@ -185,7 +191,7 @@ function Trade.install(Anchor, Core)
 			)
 			return false
 		end
-		Patch.apply(P.Data, ops, live or liveFor(P), reporter(P))
+		Patch.apply(P.Data, ops, live or liveFor(P), reporter(P), { Strict = true })
 		dropRecord(P, id)
 		local mem = rec.mock == true or Anchor.DataStoreState ~= "Access"
 		if mem then
@@ -255,13 +261,40 @@ function Trade.install(Anchor, Core)
 		return seen
 	end
 
+	-- Persistent ring of the last GIFT_RING gift ids applied (MetaData.Anchor.Gifts), saved
+	-- with the data: a gift queued twice (a send retried after a committed-but-errored
+	-- write) applies once even across sessions. Count-bounded, never time-pruned.
+	local function giftApplied(profile, id): boolean
+		if seenThisSession(profile)[id] == true then
+			return true
+		end
+		local ring = profile.anchor_meta.Gifts
+		return type(ring) == "table" and table.find(ring, id) ~= nil
+	end
+
+	local function rememberGift(profile, id)
+		seenThisSession(profile)[id] = true
+		local ring = profile.anchor_meta.Gifts
+		if type(ring) ~= "table" then
+			ring = {}
+			profile.anchor_meta.Gifts = ring
+		end
+		table.insert(ring, id)
+		local excess = #ring - GIFT_RING
+		if excess > 0 then
+			table.move(ring, excess + 1, #ring, 1)
+			for i = #ring - excess + 1, #ring do
+				ring[i] = nil
+			end
+		end
+	end
+
 	Core.AddHook("Message", function(profile, message, processed)
 		if type(message) ~= "table" or type(message.AnchorTx) ~= "string" or type(message.Patch) ~= "table" then
 			return false -- not ours (or not well-formed): user handlers see it
 		end
-		local seen = seenThisSession(profile)
-		if seen[message.AnchorTx] ~= true then
-			seen[message.AnchorTx] = true -- the same message queued twice applies once
+		if not giftApplied(profile, message.AnchorTx) then
+			rememberGift(profile, message.AnchorTx) -- same tick as the apply, same save
 			local ok_patch, problem = Patch.check(message.Patch)
 			if ok_patch ~= true then
 				report(profile, `Anchor gift {message.AnchorTx} has an invalid patch ({tostring(problem)}); dropped`)
@@ -401,8 +434,8 @@ function Trade.install(Anchor, Core)
 			return true
 		end
 
-		local outA, inA = Patch.split(PA)
-		local outB, inB = Patch.split(PB)
+		local outA, inA = Patch.split(PA, baseA)
+		local outB, inB = Patch.split(PB, baseB)
 		local id = newId()
 		local mock = A.is_mock == true or B.is_mock == true
 		local function record(role, P, peer, refund, incoming)

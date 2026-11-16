@@ -400,6 +400,12 @@ local function applyOp(root, live, op, ctx, inverse)
 			table.insert(inverse, if old == nil then { "Remove", path } else { "Inc", path, -value })
 		end
 	elseif kind == "Set" then
+		if ctx.strict and old ~= nil then
+			if deepEqual(old, value) then
+				return -- already there (idempotent)
+			end
+			return skip(ctx, path, n, "Set onto an existing, different value (never overwritten)")
+		end
 		write(plain, live, key, deepCopy(value), ctx)
 		if created_at == nil then
 			table.insert(inverse, if old == nil then { "Remove", path } else { "Set", path, deepCopy(old) })
@@ -414,7 +420,9 @@ end
 
 -- Patch.apply(root, patch, live?, report?, opts?) -> inverse_patch, skipped_ops
 -- opts.Parents = "create" (default: missing parent tables are created) | "template"
--- (created only where opts.Template has a table at that path). An op is skipped (and
+-- (created only where opts.Template has a table at that path).
+-- opts.Strict = true: a Set never overwrites an existing value (equal -> already applied,
+-- different -> skipped and reported). Used for trade incoming / refund. An op is skipped (and
 -- reported) rather than ever replacing an existing non-table value with a table, or an
 -- existing non-number with an Inc.
 function Patch.apply(root, patch, live, report, opts)
@@ -424,6 +432,7 @@ function Patch.apply(root, patch, live, report, opts)
 		missed = 0,
 		parents = opts and opts.Parents or "create",
 		template = opts and opts.Template,
+		strict = opts ~= nil and opts.Strict == true,
 	}
 	local inverse = {}
 	for _, op in ipairs(patch) do
@@ -437,8 +446,9 @@ function Patch.apply(root, patch, live, report, opts)
 	return reversed, ctx.missed
 end
 
--- Patch.conflict(root, patch) -> problem? : would apply() (create mode) skip any op on
--- `root` because a value has the wrong type? (Pulls of missing items are not conflicts.)
+-- Patch.conflict(root, patch) -> problem? : would apply() (create + strict mode) skip any
+-- op on `root` because a value has the wrong type or a Set would overwrite a different
+-- value? (Pulls of missing items are not conflicts.)
 function Patch.conflict(root, patch): string?
 	local scratch = deepCopy(root)
 	local problem = nil
@@ -446,18 +456,34 @@ function Patch.conflict(root, patch): string?
 		if problem == nil and not string.find(message, "array item to remove", 1, true) then
 			problem = message
 		end
-	end)
+	end, { Strict = true })
 	return problem
 end
 
--- Patch.split(patch) -> outgoing, incoming
--- outgoing: what leaves this side (Remove, Pull, negative Inc); incoming: the rest.
-function Patch.split(patch)
+local function valueAt(root, path)
+	local node = root
+	for _, key in ipairs(path) do
+		if type(node) ~= "table" then
+			return nil
+		end
+		node = node[key]
+	end
+	return node
+end
+
+-- Patch.split(patch, base) -> outgoing, incoming
+-- outgoing: what leaves this side (Remove, Pull, negative Inc, and the old value of a Set
+-- that overwrites one: Remove(path)); incoming: the rest (Set onto an empty key, Push,
+-- positive Inc).
+function Patch.split(patch, base)
 	local outgoing, incoming = {}, {}
 	for _, op in ipairs(patch) do
 		local kind = op[1]
 		if kind == "Remove" or kind == "Pull" or (kind == "Inc" and op[3] < 0) then
 			table.insert(outgoing, op)
+		elseif kind == "Set" and base ~= nil and valueAt(base, op[2]) ~= nil then
+			table.insert(outgoing, { "Remove", op[2] })
+			table.insert(incoming, op)
 		else
 			table.insert(incoming, op)
 		end

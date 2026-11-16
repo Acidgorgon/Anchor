@@ -16,8 +16,9 @@
 	Rules:
 	  * The grant runs on a copy of the player's data. Its changes are applied (through the
 	    Ripple state if UseRipple is on) together with the PurchaseId in a dedup ledger
-	    (MetaData.Anchor.Receipts: every unconfirmed id, plus the newest 100 confirmed ones)
-	    in the same tick, then the profile is
+	    (MetaData.Anchor.Receipts: every unconfirmed id, plus the newest 100 confirmed ones;
+	    an id is "confirmed" only once PurchaseGranted was actually returned for it, a flag
+	    persisted in MetaData.Anchor.ReceiptsAck) in the same tick, then the profile is
 	    force-saved. PurchaseGranted is returned only after a save containing the PurchaseId
 	    succeeded; otherwise NotProcessedYet and Roblox retries later.
 	  * A retried / duplicate receipt whose id is in the ledger is never granted again.
@@ -115,13 +116,28 @@ function Receipts.install(Anchor, Core)
 			return NOT_YET
 		end
 
+		-- Marks id "confirmed": PurchaseGranted is being returned for it right now. Only
+		-- confirmed ids may ever be trimmed from the ledger (persisted with the next save).
+		local function acknowledge()
+			local acks = profile.anchor_meta.ReceiptsAck
+			if type(acks) ~= "table" then
+				acks = {}
+				profile.anchor_meta.ReceiptsAck = acks
+			end
+			if acks[id] ~= true then
+				acks[id] = true
+				profile:MarkMetaDirty()
+			end
+			return GRANTED
+		end
+
 		local function confirm()
 			if savedSet(profile)[id] == true then
-				return GRANTED
+				return acknowledge()
 			end
 			if profile:SaveAsync() == true then
 				savedSet(profile)[id] = true
-				return GRANTED
+				return acknowledge()
 			end
 			return NOT_YET
 		end
@@ -163,17 +179,22 @@ function Receipts.install(Anchor, Core)
 			profile.anchor_meta.Receipts = ledger
 		end
 		table.insert(ledger, id)
-		-- Trim only ids whose save is confirmed, oldest first, keeping the newest LEDGER_SIZE;
-		-- an unconfirmed id is never dropped (Roblox will retry it).
-		local saved = savedSet(profile)
-		local excess = #ledger - LEDGER_SIZE
-		local i = 1
-		while excess > 0 and i <= #ledger do
-			if saved[ledger[i]] == true then
-				table.remove(ledger, i)
-				excess -= 1
-			else
-				i += 1
+		-- Trim only confirmed ids (PurchaseGranted was returned for them), oldest first,
+		-- keeping the newest LEDGER_SIZE; an unconfirmed id is never dropped, however old,
+		-- because Roblox may still retry it.
+		local acks = profile.anchor_meta.ReceiptsAck
+		if type(acks) == "table" then
+			local excess = #ledger - LEDGER_SIZE
+			local i = 1
+			while excess > 0 and i <= #ledger do
+				local old_id = ledger[i]
+				if acks[old_id] == true then
+					table.remove(ledger, i)
+					acks[old_id] = nil
+					excess -= 1
+				else
+					i += 1
+				end
 			end
 		end
 		profile:MarkMetaDirty()
