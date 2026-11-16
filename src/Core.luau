@@ -23,7 +23,8 @@
 	  * O(1) autosave list (circular doubly linked list with stock's cursor semantics).
 	  * Profile:SaveAsync(): yielding forced save -> true once a write that contains the
 	    current state succeeded while this session still owns the profile.
-	  * Hooks for trades / receipts / easy API (Core.Hooks).
+	  * Hooks for trades / receipts / easy API (Core.Hooks); options.Mock routes a whole
+	    store to the in-memory store (dev option, guarded in init.luau).
 --]]
 
 local Signal = require(script.Parent.Signal)
@@ -103,8 +104,9 @@ local Hooks = {
 	-- fn(profile, latest_data) inside the save transform, only when this session owns
 	-- the key and is about to write it.
 	BeforeWrite = {},
-	-- fn(profile, wrote: boolean) after a save reached the DataStore; wrote = our state
-	-- was written while this session owned the key.
+	-- fn(profile, wrote: boolean, raw: table) after a save reached the DataStore; wrote =
+	-- our state was written while this session owned the key; raw = the stored envelope
+	-- returned by the call (when wrote, exactly what was written, MetaData.Anchor included).
 	AfterSave = {},
 }
 
@@ -424,9 +426,13 @@ local function IsThisSession(session_tag)
 	return session_tag[1] == PlaceId and session_tag[2] == JobId
 end
 
-local function ReadMockFlag(): boolean
+local function ReadMockFlag(profile_store): boolean
 	local is_mock = MockFlag
 	MockFlag = false
+	-- [Anchor] a store created with options.Mock = true always uses the in-memory store:
+	if is_mock == false and profile_store ~= nil and profile_store.anchor_options ~= nil then
+		is_mock = profile_store.anchor_options.Mock == true
+	end
 	return is_mock
 end
 
@@ -511,7 +517,7 @@ local function EffectiveLockRefresh(options): number
 end
 
 local function EncodeAux(profile): buffer
-	return Codec.encode({ profile.UserIds, profile.RobloxMetaData, profile.anchor_meta })
+	return Codec.encode({ u = profile.UserIds, r = profile.RobloxMetaData, a = profile.anchor_meta })
 end
 
 -- Encodes (and verifies) `data`. Returns blob or nil, error message.
@@ -951,7 +957,8 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 			end
 
 			if #Hooks.AfterSave > 0 then
-				RunHookList(Hooks.AfterSave, profile, result)
+				-- `wrote`, not `result`: a release save writes our state but ends the session.
+				RunHookList(Hooks.AfterSave, profile, wrote, loaded_data)
 			end
 
 			if profile.OnAfterSave:GetListenerCount() > 0 then
@@ -1334,12 +1341,14 @@ local function ResolveOptions(options)
 		LockRefresh = lock_refresh,
 		IsDirty = options.IsDirty,
 		ClearDirty = options.ClearDirty,
+		Mock = options.Mock == true, -- [Anchor] every call on this store uses the in-memory store
 	}
 end
 
 -- [Anchor] third argument `options` is ours (stock ignores extra args):
 --   { Format = "Compat"|"Compact", VerifyWrites = true, LockRefresh = 300,
---     IsDirty = fn(profile) -> boolean, ClearDirty = fn(profile) }
+--     IsDirty = fn(profile) -> boolean, ClearDirty = fn(profile),
+--     Mock = false -- true: every call on this store uses the in-memory (store.Mock) store }
 function ProfileStore.New(store_name, template, options)
 	template = template or {}
 
@@ -1473,7 +1482,7 @@ local function RunLoadHooks(profile)
 end
 
 function ProfileStore:StartSessionAsync(profile_key, params)
-	local is_mock = ReadMockFlag()
+	local is_mock = ReadMockFlag(self)
 
 	if type(profile_key) ~= "string" then
 		error(`[{LIB}]: profile_key must be a string`)
@@ -1755,7 +1764,7 @@ function ProfileStore:StartSessionAsync(profile_key, params)
 end
 
 function ProfileStore:MessageAsync(profile_key, message)
-	local is_mock = ReadMockFlag()
+	local is_mock = ReadMockFlag(self)
 
 	if type(profile_key) ~= "string" then
 		error(`[{LIB}]: profile_key must be a string`)
@@ -1839,7 +1848,7 @@ function ProfileStore:MessageAsync(profile_key, message)
 end
 
 function ProfileStore:GetAsync(profile_key, version)
-	local is_mock = ReadMockFlag()
+	local is_mock = ReadMockFlag(self)
 
 	if type(profile_key) ~= "string" then
 		error(`[{LIB}]: profile_key must be a string`)
@@ -1916,7 +1925,7 @@ function ProfileStore:GetAsync(profile_key, version)
 end
 
 function ProfileStore:RemoveAsync(profile_key)
-	local is_mock = ReadMockFlag()
+	local is_mock = ReadMockFlag(self)
 
 	if type(profile_key) ~= "string" or string.len(profile_key) == 0 then
 		error(`[{LIB}]: Invalid profile_key`)
@@ -2127,7 +2136,7 @@ function ProfileVersionQuery:NextAsync()
 end
 
 function ProfileStore:VersionQuery(profile_key, sort_direction, min_date, max_date)
-	local is_mock = ReadMockFlag()
+	local is_mock = ReadMockFlag(self)
 
 	if type(profile_key) ~= "string" or string.len(profile_key) == 0 then
 		error(`[{LIB}]: Invalid profile_key`)
@@ -2320,6 +2329,18 @@ return {
 	DeepCopyTable = DeepCopyTable,
 	SaveProfileAsync = SaveProfileAsync,
 	IsThisSession = IsThisSession,
+	-- [Anchor] A detached view-mode profile (never saves) holding `data`, for dev options
+	-- (View / NoSave) when the key has never been saved.
+	NewViewProfile = function(store, profile_key, data, is_mock)
+		local raw = {
+			Data = data,
+			MetaData = { ProfileCreateTime = os.time(), SessionLoadCount = 0, MetaTags = {} },
+			GlobalUpdates = { 0, {} },
+		}
+		local profile = Profile.New(raw, data, nil, nil, store, profile_key, is_mock == true)
+		profile.view_mode = true
+		return profile
+	end,
 	GetActiveProfile = function(store, profile_key, is_mock)
 		return ActiveSessionCheck[SessionToken(store.Name, profile_key, is_mock)]
 	end,

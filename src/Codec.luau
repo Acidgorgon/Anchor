@@ -46,6 +46,9 @@
 			0x08 ARR  varint n, n values
 			0x09 MAP  varint n, n x (key, value)
 			0x0A BUF  varint len, bytes
+			0x11..0x16 DEC zigzag varint m; value = m / 10^s with s = tag - 0x10
+			           (short decimals such as 73.4 or 1.99; only emitted when
+			           that division reproduces the exact double)
 			0x20..0x3F STR with len 0..31 inline
 			0x40..0x5F REF with index 0..31 inline
 			0x60..0x6F ARR with n 0..15 inline
@@ -91,6 +94,8 @@ local T_REF = 0x07
 local T_ARR = 0x08
 local T_MAP = 0x09
 local T_BUF = 0x0A
+local T_DEC0 = 0x10 -- 0x11..0x16: DEC with scale 1..6
+local POW10 = { 10, 100, 1000, 10000, 100000, 1000000 } -- exact doubles
 local T_STR0 = 0x20
 local T_REF0 = 0x40
 local T_ARR0 = 0x60
@@ -240,11 +245,38 @@ local function writeNumber(x: number, depth: number)
 	elseif x ~= x then
 		fail("number is NaN (DataStores reject NaN)", depth)
 	end
+	-- finite non-integer: try a short decimal m / 10^s (s = 1..6). The check
+	-- uses the exact expression the decoder evaluates (IEEE division is
+	-- correctly rounded everywhere), so the decoded double is bit-identical.
+	local decZ = -1
+	local decScale = 0
+	for s = 1, 6 do
+		local p = POW10[s]
+		local m = math.round(x * p)
+		if m / p == x then
+			if m < INT_LIMIT and m > -INT_LIMIT then
+				decZ = if m >= 0 then m * 2 else -m * 2 - 1
+				decScale = s
+			end
+			break
+		end
+	end
+	local decSize = if decZ >= 0 then 1 + varintSize(decZ) else 99
+	if decSize <= 5 then
+		writeu8(out, pos, T_DEC0 + decScale)
+		pos += 1
+		writeVarint(decZ)
+		return
+	end
 	writef32(f32probe, 0, x)
 	if readf32(f32probe, 0) == x then
 		writeu8(out, pos, T_F32)
 		writef32(out, pos + 1, x)
 		pos += 5
+	elseif decSize < 9 then
+		writeu8(out, pos, T_DEC0 + decScale)
+		pos += 1
+		writeVarint(decZ)
 	else
 		writeu8(out, pos, T_F64)
 		writef64(out, pos + 1, x)
@@ -724,6 +756,10 @@ decodeValue = function(depth: number): any
 		return decodeArray(readVarint(), depth + 1)
 	elseif tag == T_MAP then
 		return decodeMap(readVarint(), depth + 1)
+	elseif tag > T_DEC0 and tag <= T_DEC0 + 6 then
+		local z = readVarint()
+		local m = if z % 2 == 0 then z / 2 else -(z + 1) / 2
+		return m / POW10[tag - T_DEC0]
 	elseif tag == T_BUF then
 		local len = readVarint()
 		if len > rend - rpos then
