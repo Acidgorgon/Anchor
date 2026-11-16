@@ -111,7 +111,7 @@ Data:Bind({
 
 ## Pair it with Ripple
 
-[Ripple](https://acidgorgon.github.io/ripple/) replicates state to clients by wrapping a plain table in
+[Ripple](https://acidgorgon.github.io/Ripple/) replicates state to clients by wrapping a plain table in
 place. Tell Anchor how to wrap each profile and every Anchor write (`Update`, trades, gifts, receipts)
 goes through Ripple, so clients see it the same frame:
 

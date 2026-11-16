@@ -1,6 +1,6 @@
 # Using with Ripple
 
-[Ripple](https://acidgorgon.github.io/ripple/) replicates state to clients. Anchor saves it. They meet at
+[Ripple](https://acidgorgon.github.io/Ripple/) replicates state to clients. Anchor saves it. They meet at
 one table: `profile.Data`.
 
 - Ripple wraps `profile.Data` **in place**: `Ripple.Club.new(player, profile.Data)` writes straight through

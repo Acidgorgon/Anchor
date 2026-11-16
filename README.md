@@ -16,7 +16,7 @@ Data:Update(player, function(data) data.Coins += 10 end)
 [API reference](https://acidgorgon.github.io/Anchor/reference/api)).
 
 Part of a family of Roblox libraries: [Current](https://acidgorgon.github.io/Current/) (networking),
-[Ripple](https://acidgorgon.github.io/ripple/) (state sync) and Anchor (saving).
+[Ripple](https://acidgorgon.github.io/Ripple/) (state sync) and Anchor (saving).
 
 Status: in development. Design notes: [docs/design/spec.md](docs/design/spec.md).
 `reference/` holds an unmodified copy of ProfileStore 1.0.3 (Apache-2.0, (c) loleris / MAD STUDIO), used as the
