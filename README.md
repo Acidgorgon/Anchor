@@ -15,6 +15,9 @@ Data:Update(player, function(data) data.Coins += 10 end)
 [migrating from ProfileStore](https://acidgorgon.github.io/Anchor/guide/migrating),
 [API reference](https://acidgorgon.github.io/Anchor/reference/api)).
 
+> [!NOTE]
+> **Made with Claude.** Most of Anchor was written with [Claude](https://claude.ai), Anthropic's AI, to speed up my own Roblox workflow. Issues and pull requests are welcome.
+
 Part of a family of Roblox libraries: [Current](https://acidgorgon.github.io/Current/) (networking),
 [Ripple](https://acidgorgon.github.io/Ripple/) (state sync) and Anchor (saving).
 
