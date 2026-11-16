@@ -1,3 +1,4 @@
 tests/host/build/
 *.o
 /results/
+bench/results/
