@@ -213,3 +213,23 @@ local Data = Anchor.new("Main", Template, { NoSave = true })         -- your sav
   MessageAsync. Change signals and client sync are Ripple's job; when Ripple is
   attached (`Data:UseRipple(fn(player, profile) -> state)`), `Update` hands the
   Ripple state to fn so writes replicate.
+
+## 9. Perf pass targets (after bench 2026-11-16: Anchor was ~15x stock Luau CPU)
+
+Acid's #1 priority is server CPU, so Compat (the default) must add ZERO Luau work
+over stock on the happy path, and Compact must pay only for what it buys.
+* Compat save: no encode, no validate on the happy path. Run `Codec.validate`
+  only AFTER an UpdateAsync fails, to put the bad path in the error message.
+  Clean-save skip only when it can actually trigger (effective LockRefresh >=
+  AUTO_SAVE_PERIOD) or an IsDirty hook is set; otherwise never encode.
+* Compat LastSavedData: stock semantics and cost (deep copy at load, returned
+  table after save). Option `LastSavedData = false` skips the load copy (saves
+  ~0.8 ms + ~0.5 MB per FM profile) for games that don't read it; Anchor's own
+  Receipts/Trade must not depend on LastSavedData.
+* Compact save: exactly one encode (the encoder already validates); verify =
+  decode + equal (keep, `VerifyWrites` default true); the clean-skip check reuses
+  that same blob; the blob becomes the lazy LastSavedData.
+* Compact load: decodeInto once; the stored buffer itself is the lazy
+  LastSavedData (no extra encode, no verify on load).
+* Target: Compat within noise of stock on load and save; Compact save <= one
+  encode + one decode + one equal.
