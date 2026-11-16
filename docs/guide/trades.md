@@ -13,25 +13,27 @@ never land at exactly the same moment:
 Exploiters force step 3 on purpose (crash the server, or time a trade right before a shutdown). The
 reverse order loses the item instead of duplicating it.
 
-## How Anchor prevents it
+## How Anchor prevents it: escrow, then one decision
 
-`Anchor.Trade` never relies on two saves landing together:
+`Anchor.Trade` is a two-phase escrow with a single commit point:
 
-1. Your function runs on **copies** of both players' data. If it errors or returns `false`, nothing
-   changes.
-2. Anchor turns the changes into two small patches. Alice's patch is applied, and Bob's patch is written
-   **into Alice's save** as a pending record. Anchor saves Alice right away.
-3. Only once that save has landed does Bob get his patch, tagged with the trade's id, and Anchor saves
-   Bob. Alice keeps the pending record until Bob's save shows the trade id as applied.
-4. If anything crashes in between, the record in Alice's save is picked up again the next time her
-   profile loads. Bob's save remembers which trade ids it has applied, so a replay is applied **at most
-   once**.
+1. **Escrow.** Your function runs on **copies** of both players' data. Anchor splits each side's changes
+   into what **leaves** (removed items, coins going down) and what **arrives**. In one frame it takes the
+   leaving part out of both players' data and writes an escrow record into both saves: what to refund,
+   and what to deliver. From this moment the traded items can't be spent twice.
+2. **Save both.** Anchor saves Alice and Bob at the same time. If both escrow saves land it proposes
+   *commit*, otherwise *abort*.
+3. **Decide once.** The decision is written to a small key of its own (DataStore `"AnchorTx"`,
+   key `tx_<id>`). The first decision written wins; anyone who comes later adopts it. This is the only
+   commit point.
+4. **Apply.** On *commit* each side gets its incoming items; on *abort* each side gets its refund. The
+   escrow record is removed in the same frame, so a side can never get both.
 
-So either Alice's save never recorded the trade (nothing happened to either player), or it did and Bob is
-guaranteed to receive his side exactly once. If Bob left mid-trade, his side is sent through his save's
-message queue and applied on whichever server loads him next.
+If a server crashes anywhere in between, each player's save still holds the escrow record. When that
+player loads again (on any server), Anchor reads the decision key and finishes the job. A side that finds
+no decision proposes *abort*, which is safe: *commit* is only ever written after both escrows were saved.
 
-Numbers are patched as increments (`+40`, not `= 140`), so a replay onto newer data keeps any coins Bob
+Numbers move as increments (`+40`, not `= 140`), so applying a side later keeps any coins the player
 earned in the meantime. Arrays are treated as bags: items are added and removed by value, never by index.
 
 ## Anchor.Trade
@@ -48,6 +50,8 @@ end)
 
 if ok then
 	-- "Trade complete"
+elseif reason == "Pending" then
+	-- "Trade pending": it finishes on its own
 else
 	warn("Trade failed:", reason)
 end
@@ -55,31 +59,37 @@ end
 
 Both profiles must be loaded on this server. They can come from different stores. Only one trade runs per
 profile at a time; a second trade on the same player waits (up to 30 seconds) and then runs on the fresh
-data.
+data. A trade takes about one save, usually around a second.
 
-| Result | Meaning | Data changed? |
-|---|---|---|
-| `true` | Done. Both sides have their new data (or Bob gets his on his next load if he left). | Yes |
-| `false, "Cancelled"` | Your function returned `false`. | No |
-| `false, "Error", message` | Your function errored. | No |
-| `false, "Invalid", message` | Bad arguments, the same profile twice, a read-only (`View`/`NoSave`) profile, or values a DataStore can't store. | No |
-| `false, "Inactive"` | A player isn't loaded on this server (left, or not loaded yet). | No |
-| `false, "Busy"` | Another trade on one of them didn't finish within the timeout. | No |
-| `false, "SaveFailed"` | Alice's save kept failing (DataStore outage). The trade was undone. | No |
-| `false, "SessionLost"` | Alice's session ended mid-trade and no save could be confirmed. Usually nothing changed; if the trade did reach her save, it completes on her next load. | Never duplicated or lost |
+| Result | Meaning |
+|---|---|
+| `true` | Committed. Both players have their new data (a player who left mid-trade gets their side on their next load). |
+| `false, "Cancelled"` | Your function returned `false`. Nothing changed. |
+| `false, "Error", message` | Your function errored, or a player's data changed while it ran. Nothing changed. |
+| `false, "Invalid", message` | Bad arguments, the same profile twice, a read-only (`View`/`NoSave`) profile, or values a DataStore can't store. Nothing changed. |
+| `false, "Inactive"` | A player isn't loaded on this server. Nothing changed. |
+| `false, "Busy"` | Another trade on one of them didn't finish within the timeout. Nothing changed. |
+| `false, "TooBig"` | A save would go over the DataStore's 4 MB limit. Nothing changed. |
+| `false, "SaveFailed"` | An escrow save failed (DataStore trouble). Aborted and refunded. |
+| `false, "SessionLost"` | A player left or lost their session before their escrow saved. Aborted and refunded. |
+| `false, "Aborted"` | Another server decided first (abort). Refunded. |
+| `false, "Pending"` | The decision key couldn't be reached. The traded items stay in escrow (unspendable) and the trade commits or refunds itself as soon as the key is reachable. Show "Trade pending". |
+
+Every abort refunds both sides. Nothing is duplicated or lost.
 
 Options (fourth argument):
 
 ```lua
 Anchor.Trade(a, b, fn, {
-	Timeout = 30,           -- seconds to wait for another trade on the same player
+	Timeout = 30,            -- seconds to wait for another trade on the same player
 	Live = { liveA, liveB }, -- Ripple states to write through (default: the UseRipple states)
 })
 ```
 
 ::: tip
-The function gets copies, so it can't yield its way into a race: check balances **inside** the function,
-not before calling `Trade`.
+Check balances and ownership **inside** the function, not before calling `Trade`. The function sees the
+latest data, and if something writes to either player while it runs, the trade returns `"Error"` instead
+of trading on stale data.
 :::
 
 If only one side's data changes, Anchor applies it as a normal edit (saved with the next autosave), since
@@ -87,47 +97,46 @@ there is nothing to keep in sync.
 
 ### While a trade is committing
 
-A trade takes about one save (typically around a second). During that window `profile:IsTrading()` is
-`true`, and `Data:Update(player, fn)` waits for the trade to finish so its change lands on the post-trade
-data. Direct writes to `profile.Data` are **not** held back, so route gameplay writes through
-`Data:Update` (or check `IsTrading()`).
+During the commit `profile:IsTrading()` is `true`, and `Data:Update(player, fn)` waits for the trade to
+finish so its change lands on the post-trade data. Direct writes to `profile.Data` are **not** held back,
+so route gameplay writes through `Data:Update` (or check `IsTrading()`).
 
 ### Trades that need a human
 
-Bob's save forgets applied trade ids after 90 days (or beyond 2000 of them). If Alice's pending record is
-older than that window and Bob's save shows neither the trade applied nor queued, Anchor can't tell
-whether Bob already got it, so it does **not** resend it (that could duplicate). It keeps the record,
-fires `Anchor.OnError` with `NEEDS MANUAL REVIEW`, and lists it in `Data:PendingTrades(profile)`:
+Applying a side is never forced onto data it no longer fits. If, say, an `Inc` would land on a field that
+is no longer a number (because you migrated your data shape in between), Anchor keeps the escrow record,
+leaves the items in escrow, fires `Anchor.OnError` with `NEEDS MANUAL REVIEW`, and lists it in
+`Data:PendingTrades(profile)`:
 
 ```lua
 for _, rec in Data:PendingTrades(profile) do
-	print(rec.Id, rec.Store, rec.Key, rec.Status, rec.Created) -- Status: "NeedsReview", "Waiting", ...
+	print(rec.Id, rec.Role, rec.Key, rec.Status) -- Status: "NeedsReview", "Resolving" or "Waiting"
 end
 ```
 
-In normal play this never happens: it takes a pending record to sit unresolved for months.
-
 ## Gifts
 
-`Data:Gift` changes a player's data whether they're on this server, another server, or offline. It goes
-through the save's message queue and is applied exactly once by whichever server owns the profile, now or
-at their next join.
+`Data:Gift` changes a player's data whether they're on this server, another server, or offline. It rides
+the save's message queue and is applied exactly once by whichever server owns the profile, now or at their
+next join: the change and the removal of the message land in the same save.
 
 ```lua
 Data:Gift(userId, function(data)
 	data.Coins += 50
 end)
-
--- With an Id, the same gift is applied at most once per player (for example a login reward).
--- The player's save remembers applied ids for 90 days (up to 2000 of them).
-Data:Gift(userId, function(data) data.Coins += 500 end, { Id = "launch_2026" })
 ```
 
 The function runs on a copy of the latest data Anchor can see, and its changes are sent as a patch, so
-progress the player makes in the meantime is kept. It returns `true`, or `false` with a reason
-(`"Cancelled"`, `"Error"`, `"Invalid"`, or `"Failed"` if the message couldn't be sent).
+progress the player makes in the meantime is kept. A gift never brings back a parent table the player no
+longer has (a sold pet doesn't come back as an empty stub) unless your template defines it.
 
-The target is a UserId (key `KeyPrefix .. UserId`) or a full key string.
+It returns `true`, or `false` with a reason (`"Cancelled"`, `"Error"`, `"Invalid"`, or `"Failed"` if the
+message couldn't be stored). The target is a UserId (key `KeyPrefix .. UserId`) or a full key string.
+
+::: warning
+Every `Gift` call sends a new gift. If your own code might call it twice for the same reward (for example
+a retry after a timeout), keep your own "already given" flag in the player's data.
+:::
 
 ## Receipts (developer products)
 
@@ -159,6 +168,7 @@ end
 
 - The grant runs on a copy. Its changes and the `PurchaseId` are applied together, then the profile is
   saved. If that save fails, Roblox retries later and the grant is **not** applied again.
+- The ledger keeps every `PurchaseId` whose save isn't confirmed yet, plus the newest 100 confirmed ones.
 - A grant that errors or returns `false` changes nothing and returns `NotProcessedYet`.
 - The player must be in this server with their data loaded, otherwise `NotProcessedYet` (Roblox
   delivers it again when they join).

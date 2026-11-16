@@ -13,7 +13,7 @@ The stored value is exactly what ProfileStore writes: `Data` is your plain table
 (`MetaData`, `UserIds`, `GlobalUpdates`, ...) is field-for-field the stock one. Old ProfileStore servers
 and Anchor servers can hand the same profile back and forth with nothing lost.
 
-Anchor's own bookkeeping (pending trades, applied trade ids, the receipt ledger) lives in one extra field,
+Anchor's own bookkeeping (trade escrow records, the receipt ledger) lives in one extra field,
 `MetaData.Anchor`. ProfileStore keeps fields it doesn't know about, so this survives a trip through an old
 server. If you never trade, gift or use receipts, there is no `MetaData.Anchor` at all.
 
@@ -26,9 +26,13 @@ Data = { AnchorBlob = <buffer> }
 ```
 
 The codec writes every key name once, packs small numbers into a byte or two and short decimals
-(`1.99`, `73.4`) exactly. Before each Compact write Anchor decodes the buffer again and compares it with
-your data (`VerifyWrites`, on by default). If they ever differ, that save is written as Compat instead and
-`Anchor.OnError` fires.
+(`1.99`, `73.4`) exactly. The buffer is made inside the save itself, at the same instant as the rest of
+the write. Before using it Anchor decodes it again and compares it with your data (`VerifyWrites`, on by
+default). If they ever differ, that save is written as Compat instead and `Anchor.OnError` fires.
+
+Compact costs Luau time that Compat doesn't: one encode plus that check on every save, about 2.2–2.6 ms
+for the large save below (Compat costs what ProfileStore costs). In exchange Roblox's C++ JSON step has a
+third of the text to handle. See [Benchmarks](/benchmarks).
 
 ### How much smaller
 
@@ -61,6 +65,20 @@ Two things old servers *can* still do with a Compact profile:
 - `MessageAsync` to it works; the message is delivered when an Anchor server loads the profile.
 - `GetAsync` returns a view whose `Data` is the raw `{ AnchorBlob = ... }`, not your table.
 
+### Admin tools built on ProfileStore
+
+A stock admin tool (`GetAsync`, edit, `SetAsync`) can't wipe a Compact profile either, but it can't edit
+one: Anchor treats the blob as the only source of truth.
+
+- **Keys added beside the blob** (for example `Data.Coins = 0` next to `AnchorBlob`) are ignored. Anchor
+  loads the blob, fires `Anchor.OnError` naming the stray keys, and drops them on the next save.
+- **`Data` replaced wholesale** (no blob, counter still `"Anchor"`) is refused: the profile won't load,
+  `OnError` fires, `Bind` kicks the player, and the stored value is left exactly as it is so you can
+  restore it from version history. Anchor never guesses which data is real.
+
+Edit Compact profiles with Anchor itself (`Data:GetAsync(key)` returns your decoded table), or switch the
+store back to Compat first.
+
 ## When to switch
 
 1. Ship Anchor with the default **Compat**. Old and new servers can run side by side.
@@ -79,7 +97,8 @@ to load and be kicked (their data stays safe).
 
 Both formats store what Roblox stores. If a save is rejected (for example a function or an `Instance`
 inside your data), Anchor reports it through `Anchor.OnError` like ProfileStore does, and adds the path of
-the first bad value, such as `Data.Inventory[3]`. The profile stays loaded and the next save tries again.
+the first bad value, such as `Data.Inventory[3]`. That check only runs after a write has failed, so it
+costs nothing on normal saves. The profile stays loaded and the next save tries again.
 
 In Compact mode, data the codec can't encode but Roblox would accept (mixed tables, sparse arrays) is
 saved in the plain Compat form for that save, with a warning.

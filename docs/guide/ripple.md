@@ -43,9 +43,10 @@ end)
 
 ## Trades replicate in one frame
 
-`Anchor.Trade` applies both players' changes through their Ripple states in the same frame, so both
-clients see the trade at once. Your trade function still works on plain copies; only the final
-changes go through Ripple.
+`Anchor.Trade` writes through both players' Ripple states, and each step happens to both players in the
+same frame: the traded items leave both sides together when they go into escrow, and arrive on both sides
+together once the trade commits (about a second later). On an abort both refunds land together instead.
+Your trade function still works on plain copies; only these changes go through Ripple.
 
 If Ripple's schema rejects a write (for example a field the schema doesn't know), Anchor writes that value
 straight into `profile.Data` instead and fires `Anchor.OnError`. The data stays correct and saved; only

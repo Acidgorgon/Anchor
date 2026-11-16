@@ -20,10 +20,15 @@ When any of these is active, Anchor prints which ones in the output, for example
 |---|---|---|
 | `Mock` | `true` | Every call on this store uses an in-memory store. Nothing touches the real DataStore. Data lives until the test session ends. |
 | `Reset` | `true` | Every join starts from the template. The session is real and is saved, so the old data stays in the key's version history (Anchor never calls `RemoveAsync`). |
-| `PlayAs` | UserId | The **first** player to join plays on that user's save (`Player_<id>`). Changes are saved to it. Their `UserIds` aren't touched. Everyone else loads their own save. |
+| `PlayAs` | UserId | The **first** player to join plays on that user's save. Changes are saved to it. Their `UserIds` aren't touched. Everyone else loads their own save. |
 | `View` | UserId | Every player who joins gets a read-only copy of that user's save. `Update` works in memory, nothing is ever written and no session lock is taken. |
 | `NoSave` | `true` | Your own save, loaded read-only: never written, no session lock. A player with no save gets the template. |
 | `KeyPrefix` | string | Not a dev option (works live too): `Bind`, `Send` and `Gift` use `KeyPrefix .. UserId` as the key. Default `"Player_"`. |
+
+`PlayAs` and `View` find the target's save the same way `Bind` finds everyone's: `KeyPrefix .. UserId`, or
+your `Bind({ Key = ... })` function called with a stand-in player whose `UserId` is the target's. If your
+`Key` function can't build that key (it errors or returns nothing), the player is kicked with an
+`OnError` report; Anchor never falls back to another save.
 
 `Data:Reset(player)` does the same as `Reset` mid-session: it refills that player's data from the
 template in place (through the Ripple state if you use one) and returns `true`.

@@ -35,6 +35,9 @@ profile.OnSessionEnd:Connect(function() player:Kick() end)
   `OnCriticalToggle`, `IsClosing`, `IsCriticalState`, `DataStoreState`.
 - **Older saves load as is**, including profiles written by ProfileService.
 
+Anchor adds one DataStore of its own, `"AnchorTx"`, holding one small decision key per trade. Nothing
+else is created.
+
 One addition you may want: `profile:SaveAsync()` saves now and yields until the write lands, returning
 `true` or `false` (stock `profile:Save()` doesn't tell you).
 
@@ -48,10 +51,11 @@ Keep two things in mind until the last old server is gone:
 
 - **Stay on `Format = "Compat"`** (the default). [Compact](/guide/save-formats#when-to-switch) is for
   after.
-- **Old message handlers see Anchor's messages.** Gifts and trade deliveries travel through the
-  profile's message queue as tables with an `AnchorTx` field (and `Send` uses `AnchorTopic`). If your old
-  `MessageHandler` calls `processed()` on messages it doesn't recognise, an old server could drop one.
-  Only mark messages you handled as processed.
+- **Old message handlers see Anchor's messages.** Gifts travel through the profile's message queue as
+  tables with an `AnchorTx` field (and `Send` uses `AnchorTopic`). If your old `MessageHandler` calls
+  `processed()` on messages it doesn't recognise, an old server could drop one. Only mark messages you
+  handled as processed. Trades don't use the queue: a profile with a trade in escrow keeps its record
+  through an old server and finishes the trade when it next loads on Anchor.
 
 ## 3. Simplify (optional)
 

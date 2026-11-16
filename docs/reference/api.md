@@ -32,9 +32,9 @@ Third argument of `Anchor.new`. Every field is optional.
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `Format` | `"Compat" \| "Compact"` | `"Compat"` | How `Data` is written. See [Save formats](/guide/save-formats). |
-| `VerifyWrites` | `boolean` | `true` | Compact only: decode and compare each blob before writing it; on a mismatch that save is written Compat and `OnError` fires. |
+| `VerifyWrites` | `boolean` | `true` | Compact only: decode and compare each blob before writing it; on a mismatch that save is written Compat and `OnError` fires. Part of Compact's per-save cost. |
 | `KeyPrefix` | `string` | `"Player_"` | Key used by `Bind`, `Send`, `Gift` and receipts: `KeyPrefix .. UserId`. Must be non-empty. |
-| `LastSavedData` | `boolean` | `true` | `false` skips the copy of the data kept at load; `profile.LastSavedData` is then always `nil`. Saves memory and CPU for games that never read it. |
+| `LastSavedData` | `boolean` | `true` | `false` skips the deep copy ProfileStore makes at load; `profile.LastSavedData` is then always `nil`. Saves memory (about 0.5 MB for a 112 KB save) and CPU for games that never read it. |
 | `LockRefresh` | `number` (seconds) | `300` | An unchanged autosave may be skipped only while the last write is younger than `min(LockRefresh, 0.75 × ASSUME_DEAD − AUTO_SAVE_PERIOD)`. At default constants no autosave is ever skipped. |
 | `IsDirty` | `(profile) -> boolean` | none | Return `false` to say the data is unchanged, so a skippable autosave doesn't need to compare it. See [Ripple](/guide/ripple#skipping-clean-saves-with-ripple-s-dirty-flag-advanced). |
 | `ClearDirty` | `(profile) -> ()` | none | Called when a save writes the data, to reset your dirty flag. |
@@ -74,9 +74,11 @@ Anchor.Trade(
 ) -> (ok: boolean, reason: string?, message: string?)
 ```
 
-Changes two loaded profiles so that the result can never be duplicated or lost. `fn` edits copies;
-return `false` to cancel. Reasons: `"Cancelled"`, `"Error"`, `"Invalid"`, `"Inactive"`, `"Busy"`,
-`"SaveFailed"`, `"SessionLost"` (see [Trades](/guide/trades#anchor-trade)). Yields for about one save.
+Changes two loaded profiles through a two-phase escrow, so the result can never be duplicated or lost.
+`fn` edits copies; return `false` to cancel. Reasons: `"Cancelled"`, `"Error"`, `"Invalid"`,
+`"Inactive"`, `"Busy"`, `"TooBig"`, `"SaveFailed"`, `"SessionLost"`, `"Aborted"`, `"Pending"` (see
+[Trades](/guide/trades#anchor-trade)). Yields for about one save. Each two-sided trade writes one decision key to
+the DataStore `"AnchorTx"`.
 
 - `Timeout` (default `30`): seconds to wait while another trade on either profile finishes.
 - `Live`: `{ stateA, stateB }` to write through instead of the `UseRipple` states.
@@ -111,9 +113,10 @@ Anchor.SetConstant("AUTO_SAVE_PERIOD", 60)
 Anchor.OnError: Signal<(message: string, storeName: string, key: string)>
 ```
 
-DataStore errors (as in ProfileStore), plus Anchor's own reports: a rejected save with the path of the
-bad value, a Compact verify mismatch, a Ripple write that fell back to the plain table, a trade that
-needs manual review.
+DataStore errors (as in ProfileStore; a rejected save also names the path of the bad value), plus
+Anchor's own reports: a Compact verify mismatch, a Compact profile that can't be read (no blob, or keys
+beside it), a Ripple write that fell back to the plain table, a trade whose decision key is unreachable or
+that needs manual review.
 
 ```lua
 Anchor.OnError:Connect(function(message, storeName, key)
@@ -303,17 +306,16 @@ Data:Reset(player)
 ```lua
 Store:Gift(
 	target: number | string,
-	gift: ((data: table) -> false?) | Patch,
-	options: { Id: string? }?
+	gift: ((data: table) -> false?) | Patch
 ) -> (ok: boolean, reason: string?, message: string?)  -- yields
 ```
 
 Changes a player's data wherever they are: on this server, another server, or offline (applied at their
-next join). Applied exactly once. With `Id`, the same gift is applied at most once per player (applied ids
-are remembered for 90 days, up to 2000). Reasons: `"Cancelled"`, `"Error"`, `"Invalid"`, `"Failed"`.
+next join). Each call is one gift, applied exactly once through the save's message queue. Reasons:
+`"Cancelled"`, `"Error"`, `"Invalid"`, `"Failed"` (the message couldn't be stored).
 
 ```lua
-Data:Gift(userId, function(data) data.Coins += 500 end, { Id = "launch_2026" })
+Data:Gift(userId, function(data) data.Coins += 500 end)
 ```
 
 `gift` can also be a patch: an array of operations with a path from the data root.
@@ -336,13 +338,15 @@ Only available when the `Trade` child module is present.
 
 ```lua
 Store:PendingTrades(profile: Profile) -> { {
-	Id: string, Store: string, Key: string, Patch: Patch, Created: number,
-	Status: "NeedsReview" | "Delivering" | "Waiting" | "Committing",
+	Id: string, Role: "A" | "B", Store: string, Key: string,  -- Store/Key: the other side
+	Refund: Patch, Incoming: Patch, Created: number,
+	Status: "NeedsReview" | "Resolving" | "Waiting",
 } }
 ```
 
-Trade records the profile still holds as the giving side, oldest first. `"NeedsReview"` records were not
-resent because a resend could duplicate; see [Trades that need a human](/guide/trades#trades-that-need-a-human).
+The profile's unresolved trades (items in escrow), oldest first. `"Waiting"` resolves on its own (next
+save or load); `"NeedsReview"` would overwrite changed data and is kept for you to decide; see
+[Trades that need a human](/guide/trades#trades-that-need-a-human).
 
 ```lua
 for _, rec in Data:PendingTrades(profile) do print(rec.Id, rec.Status) end
@@ -465,7 +469,7 @@ local profile = Data.Mock:StartSessionAsync("Test_1")
 | Field | Type | |
 |---|---|---|
 | `Data` | `table` | Your data. Same table for the whole session. |
-| `LastSavedData` | `table?` | The data as last saved. `nil` with `LastSavedData = false`. |
+| `LastSavedData` | `table?` | The data as last saved (Compact decodes it on first read). `nil` with `LastSavedData = false`. |
 | `FirstSessionTime` | `number` | Unix time the profile was created. |
 | `SessionLoadCount` | `number` | How many sessions have loaded this profile. |
 | `Session` | `{ PlaceId: number, JobId: string }?` | The server that owns it. |
@@ -533,7 +537,8 @@ if profile:SaveAsync() then print("Saved") end
 profile:IsTrading() -> boolean
 ```
 
-`true` while a trade involving this profile is committing (about one save).
+`true` while a trade involving this profile is committing (about one save). `Store:Update` waits for it
+to end; direct writes to `profile.Data` don't.
 
 ```lua
 if profile:IsTrading() then return end -- try again after the trade
