@@ -182,3 +182,54 @@ active players. FM-shaped data (~670 owned cards x ~10 fields) plus small data.
   writes. Writes that bypass the proxy don't set it, so the IsDirty hook may only
   skip encoding when the game routes every write through Ripple; default stays
   byte compare.
+
+## 8. Dev options (Acid 2026-11-16: "no need for DataService style, make it as plug and play and easy as possible")
+
+Anchor's own style, PascalCase like the rest of the API. One line in Studio:
+```lua
+local Data = Anchor.new("Main", Template, { Mock = true })          -- in-memory store
+local Data = Anchor.new("Main", Template, { Reset = true })         -- fresh template every join
+local Data = Anchor.new("Main", Template, { PlayAs = 123456 })      -- play on someone else's save
+local Data = Anchor.new("Main", Template, { View = 123456 })        -- read-only look, never saves
+local Data = Anchor.new("Main", Template, { NoSave = true })         -- your save, never written
+```
+* Zero-config default: works with no options. Key = `KeyPrefix .. userId`
+  (default `"Player_"`; FM passes `KeyPrefix = "PLAYER_"`). In Studio without API
+  access it falls back to the mock automatically (like stock) and says so once.
+* No-code toggles: the same options can be set as attributes on the Anchor
+  ModuleScript in Studio (`Mock`, `Reset`, `PlayAs`, `View`, `NoSave`), so you can
+  flip them from the Properties panel without editing scripts. Code options win.
+* **Safety guard:** all dev options are Studio-only. On a live server they are
+  ignored with one loud warning (a live server on a mock store, or resetting /
+  impersonating, would lose real saves). `AllowDevOptionsLive = true` overrides
+  for private test places only.
+* `Reset` never calls RemoveAsync: it starts the session normally and refills
+  Data from the template in place, so the old save stays in version history.
+  `Data:Reset(player)` does the same mid-session (Studio-guarded).
+* Small helpers on the store: `Data:Get(player)` (profile or nil),
+  `Data:Await(player)`, `Data:Update(player, fn(data))`, `Data.Loaded` /
+  `Data.Leaving` signals `(player, profile)`, `Data:Send(userId, topic, payload)`
+  + `Data:OnMessage(topic, fn(player, payload) -> processed?)` on top of
+  MessageAsync. Change signals and client sync are Ripple's job; when Ripple is
+  attached (`Data:UseRipple(fn(player, profile) -> state)`), `Update` hands the
+  Ripple state to fn so writes replicate.
+
+## 9. Perf pass targets (after bench 2026-11-16: Anchor was ~15x stock Luau CPU)
+
+Acid's #1 priority is server CPU, so Compat (the default) must add ZERO Luau work
+over stock on the happy path, and Compact must pay only for what it buys.
+* Compat save: no encode, no validate on the happy path. Run `Codec.validate`
+  only AFTER an UpdateAsync fails, to put the bad path in the error message.
+  Clean-save skip only when it can actually trigger (effective LockRefresh >=
+  AUTO_SAVE_PERIOD) or an IsDirty hook is set; otherwise never encode.
+* Compat LastSavedData: stock semantics and cost (deep copy at load, returned
+  table after save). Option `LastSavedData = false` skips the load copy (saves
+  ~0.8 ms + ~0.5 MB per FM profile) for games that don't read it; Anchor's own
+  Receipts/Trade must not depend on LastSavedData.
+* Compact save: exactly one encode (the encoder already validates); verify =
+  decode + equal (keep, `VerifyWrites` default true); the clean-skip check reuses
+  that same blob; the blob becomes the lazy LastSavedData.
+* Compact load: decodeInto once; the stored buffer itself is the lazy
+  LastSavedData (no extra encode, no verify on load).
+* Target: Compat within noise of stock on load and save; Compact save <= one
+  encode + one decode + one equal.
