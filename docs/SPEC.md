@@ -182,3 +182,34 @@ active players. FM-shaped data (~670 owned cards x ~10 fields) plus small data.
   writes. Writes that bypass the proxy don't set it, so the IsDirty hook may only
   skip encoding when the game routes every write through Ripple; default stays
   byte compare.
+
+## 8. Dev options (Acid 2026-11-16: "no need for DataService style, make it as plug and play and easy as possible")
+
+Anchor's own style, PascalCase like the rest of the API. One line in Studio:
+```lua
+local Data = Anchor.new("Main", Template, { Mock = true })          -- in-memory store
+local Data = Anchor.new("Main", Template, { Reset = true })         -- fresh template every join
+local Data = Anchor.new("Main", Template, { PlayAs = 123456 })      -- play on someone else's save
+local Data = Anchor.new("Main", Template, { View = 123456 })        -- read-only look, never saves
+local Data = Anchor.new("Main", Template, { NoSave = true })         -- your save, never written
+```
+* Zero-config default: works with no options. Key = `KeyPrefix .. userId`
+  (default `"Player_"`; FM passes `KeyPrefix = "PLAYER_"`). In Studio without API
+  access it falls back to the mock automatically (like stock) and says so once.
+* No-code toggles: the same options can be set as attributes on the Anchor
+  ModuleScript in Studio (`Mock`, `Reset`, `PlayAs`, `View`, `NoSave`), so you can
+  flip them from the Properties panel without editing scripts. Code options win.
+* **Safety guard:** all dev options are Studio-only. On a live server they are
+  ignored with one loud warning (a live server on a mock store, or resetting /
+  impersonating, would lose real saves). `AllowDevOptionsLive = true` overrides
+  for private test places only.
+* `Reset` never calls RemoveAsync: it starts the session normally and refills
+  Data from the template in place, so the old save stays in version history.
+  `Data:Reset(player)` does the same mid-session (Studio-guarded).
+* Small helpers on the store: `Data:Get(player)` (profile or nil),
+  `Data:Await(player)`, `Data:Update(player, fn(data))`, `Data.Loaded` /
+  `Data.Leaving` signals `(player, profile)`, `Data:Send(userId, topic, payload)`
+  + `Data:OnMessage(topic, fn(player, payload) -> processed?)` on top of
+  MessageAsync. Change signals and client sync are Ripple's job; when Ripple is
+  attached (`Data:UseRipple(fn(player, profile) -> state)`), `Update` hands the
+  Ripple state to fn so writes replicate.
