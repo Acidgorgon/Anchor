@@ -1,4 +1,4 @@
--- Trades under crashes: every DataStore write of the trade protocol is replayed with the
+-- Trades under crashes (escrow + decision key): every DataStore write of the protocol is replayed with the
 -- writing server crashing right BEFORE the write commits and right AFTER it commits (the
 -- server dies before it sees the result). Then both profiles are loaded on fresh servers
 -- (both orders) and must be in exactly one of two states: the trade never happened, or it
@@ -125,8 +125,8 @@ scenarios.bLeaves = function(plan)
 	plan.armed = false
 end
 
--- A's server dies right after A's intent landed; B plays on S2; A comes back on S3 and
--- recovery redelivers B's side through B's message queue to S2.
+-- S1 dies right after the commit decision landed (neither side applied it); B loads on
+-- S2, then A loads on S3: every write of that recovery is crashed in turn.
 scenarios.recovery = function(plan)
 	local s1 = Sim.newServer({ JobId = "S1" })
 	local Anchor = anchor(s1)
@@ -136,11 +136,11 @@ scenarios.recovery = function(plan)
 	local first = true
 	local rule = Sim.injectError({
 		method = "UpdateAsync",
-		key = "A",
+		store = "AnchorTx",
 		when = function(info)
 			if first then
 				first = false
-				info.server:crash() -- after commit
+				info.server:crash() -- after the decision commits
 			end
 			return false
 		end,
@@ -149,15 +149,16 @@ scenarios.recovery = function(plan)
 	Sim.advance(5)
 	rule:remove()
 	assert(not s1.alive)
+	plan.armed = true
 	local s2 = Sim.newServer({ JobId = "S2" })
 	local st2 = anchor(s2).New("Main", TEMPLATE)
 	local job = s2:spawn(st2.StartSessionAsync, st2, "B")
 	Sim.runUntil(function()
-		return job.done
+		return job.done or not s2.alive
 	end, 120)
+	Sim.advance(10)
 	local s3 = Sim.newServer({ JobId = "S3" })
 	local st3 = anchor(s3).New("Main", TEMPLATE)
-	plan.armed = true
 	s3:spawn(st3.StartSessionAsync, st3, "A")
 	Sim.advance(120)
 	plan.armed = false
@@ -251,7 +252,7 @@ T.test("crash before/after every write: A and B on one server", function()
 	T.expect((outcomes["not traded"] or 0) > 0 and (outcomes["traded once"] or 0) > 0)
 end)
 
-T.test("crash before/after every write: B leaves mid-trade (message path, B on another server)", function()
+T.test("crash before/after every write: B leaves mid-trade and loads on another server", function()
 	T.allowThreadErrors()
 	local outcomes, total, calls = exhaustive("bLeaves")
 	print(`    bLeaves: {total} writes [{table.concat(calls, ", ")}] -> {T.show(outcomes)}`)

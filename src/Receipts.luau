@@ -16,7 +16,8 @@
 	Rules:
 	  * The grant runs on a copy of the player's data. Its changes are applied (through the
 	    Ripple state if UseRipple is on) together with the PurchaseId in a dedup ledger
-	    (MetaData.Anchor.Receipts, last 100 ids) in the same tick, then the profile is
+	    (MetaData.Anchor.Receipts: every unconfirmed id, plus the newest 100 confirmed ones)
+	    in the same tick, then the profile is
 	    force-saved. PurchaseGranted is returned only after a save containing the PurchaseId
 	    succeeded; otherwise NotProcessedYet and Roblox retries later.
 	  * A retried / duplicate receipt whose id is in the ledger is never granted again.
@@ -162,8 +163,18 @@ function Receipts.install(Anchor, Core)
 			profile.anchor_meta.Receipts = ledger
 		end
 		table.insert(ledger, id)
-		while #ledger > LEDGER_SIZE do
-			table.remove(ledger, 1)
+		-- Trim only ids whose save is confirmed, oldest first, keeping the newest LEDGER_SIZE;
+		-- an unconfirmed id is never dropped (Roblox will retry it).
+		local saved = savedSet(profile)
+		local excess = #ledger - LEDGER_SIZE
+		local i = 1
+		while excess > 0 and i <= #ledger do
+			if saved[ledger[i]] == true then
+				table.remove(ledger, i)
+				excess -= 1
+			else
+				i += 1
+			end
 		end
 		profile:MarkMetaDirty()
 

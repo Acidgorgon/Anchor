@@ -295,6 +295,29 @@ local function pathText(path, n)
 	return "Data." .. table.concat(parts, ".")
 end
 
+local function skip(ctx, path, n, why)
+	ctx.missed += 1
+	if ctx.report ~= nil then
+		ctx.report(`patch op skipped at {pathText(path, n)}: {why}`)
+	end
+end
+
+-- May a missing parent at path[1..i] be created? "create": yes. "template": only where
+-- the template has a table at that path (a sold item never comes back as a stub).
+local function mayCreate(ctx, path, i): boolean
+	if ctx.parents ~= "template" then
+		return true
+	end
+	local t = ctx.template
+	for j = 1, i do
+		if type(t) ~= "table" then
+			return false
+		end
+		t = t[path[j]]
+	end
+	return type(t) == "table"
+end
+
 local function applyOp(root, live, op, ctx, inverse)
 	local kind, path, value = op[1], op[2], op[3]
 	local n = #path
@@ -311,15 +334,16 @@ local function applyOp(root, live, op, ctx, inverse)
 			if not creates then
 				return -- nothing to remove
 			end
+			if child ~= nil then
+				return skip(ctx, path, i, "parent is not a table (never replaced)")
+			end
+			if not mayCreate(ctx, path, i) then
+				return skip(ctx, path, i, "parent no longer exists")
+			end
 			ctx.pathText = pathText(path, i)
 			if created_at == nil then
 				created_at = i
-				local old = plain[key]
-				local undo_path = table.move(path, 1, i, 1, {})
-				table.insert(
-					inverse,
-					if old == nil then { "Remove", undo_path } else { "Set", undo_path, deepCopy(old) }
-				)
+				table.insert(inverse, { "Remove", table.move(path, 1, i, 1, {}) })
 			end
 			write(plain, live, key, {}, ctx)
 			child = plain[key]
@@ -350,8 +374,7 @@ local function applyOp(root, live, op, ctx, inverse)
 				end
 			end
 			if index == nil then
-				ctx.missed += 1
-				return
+				return skip(ctx, path, n, "array item to remove is not there")
 			end
 			if live == nil then
 				table.remove(arr, index)
@@ -369,15 +392,12 @@ local function applyOp(root, live, op, ctx, inverse)
 	local key = path[n]
 	local old = plain[key]
 	if kind == "Inc" then
-		local base = if type(old) == "number" then old else 0
-		write(plain, live, key, base + value, ctx)
+		if old ~= nil and type(old) ~= "number" then
+			return skip(ctx, path, n, `Inc onto a {typeof(old)} (never replaced)`)
+		end
+		write(plain, live, key, (old or 0) + value, ctx)
 		if created_at == nil then
-			table.insert(
-				inverse,
-				if type(old) == "number" then { "Inc", path, -value }
-					elseif old == nil then { "Remove", path }
-					else { "Set", path, deepCopy(old) }
-			)
+			table.insert(inverse, if old == nil then { "Remove", path } else { "Inc", path, -value })
 		end
 	elseif kind == "Set" then
 		write(plain, live, key, deepCopy(value), ctx)
@@ -392,9 +412,19 @@ local function applyOp(root, live, op, ctx, inverse)
 	end
 end
 
--- Patch.apply(root, patch, live?, report?) -> inverse_patch, missed_pulls
-function Patch.apply(root, patch, live, report)
-	local ctx = { report = report, pathText = "Data", missed = 0 }
+-- Patch.apply(root, patch, live?, report?, opts?) -> inverse_patch, skipped_ops
+-- opts.Parents = "create" (default: missing parent tables are created) | "template"
+-- (created only where opts.Template has a table at that path). An op is skipped (and
+-- reported) rather than ever replacing an existing non-table value with a table, or an
+-- existing non-number with an Inc.
+function Patch.apply(root, patch, live, report, opts)
+	local ctx = {
+		report = report,
+		pathText = "Data",
+		missed = 0,
+		parents = opts and opts.Parents or "create",
+		template = opts and opts.Template,
+	}
 	local inverse = {}
 	for _, op in ipairs(patch) do
 		applyOp(root, live, op, ctx, inverse)
@@ -405,6 +435,62 @@ function Patch.apply(root, patch, live, report)
 		reversed[#reversed + 1] = inverse[i]
 	end
 	return reversed, ctx.missed
+end
+
+-- Patch.conflict(root, patch) -> problem? : would apply() (create mode) skip any op on
+-- `root` because a value has the wrong type? (Pulls of missing items are not conflicts.)
+function Patch.conflict(root, patch): string?
+	local scratch = deepCopy(root)
+	local problem = nil
+	Patch.apply(scratch, patch, nil, function(message)
+		if problem == nil and not string.find(message, "array item to remove", 1, true) then
+			problem = message
+		end
+	end)
+	return problem
+end
+
+-- Patch.split(patch) -> outgoing, incoming
+-- outgoing: what leaves this side (Remove, Pull, negative Inc); incoming: the rest.
+function Patch.split(patch)
+	local outgoing, incoming = {}, {}
+	for _, op in ipairs(patch) do
+		local kind = op[1]
+		if kind == "Remove" or kind == "Pull" or (kind == "Inc" and op[3] < 0) then
+			table.insert(outgoing, op)
+		else
+			table.insert(incoming, op)
+		end
+	end
+	return outgoing, incoming
+end
+
+-- Patch.size(value) -> approximate JSON byte length (buffers as base64).
+function Patch.size(value, depth): number
+	depth = depth or 0
+	local t = type(value)
+	if t == "string" then
+		return #value + 2
+	elseif t == "number" then
+		return #tostring(value)
+	elseif t == "boolean" then
+		return 5
+	elseif t == "buffer" then
+		return math.ceil(buffer.len(value) / 3) * 4 + 40
+	elseif t == "table" then
+		if depth > 200 then
+			return 0
+		end
+		local n = 2
+		for k, v in next, value do
+			n += Patch.size(v, depth + 1) + 1
+			if type(k) == "string" then
+				n += #k + 3
+			end
+		end
+		return n
+	end
+	return 4
 end
 
 -- Patch.replace(current, target) -> patch that makes `current` deep-equal `target` with

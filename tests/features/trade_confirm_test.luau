@@ -1,5 +1,6 @@
--- A's trade record is dropped only once B has APPLIED the patch (never on "message
--- accepted"); ambiguous redos are held for manual review; Update waits for a trade.
+-- Escrow-specific behaviour: an unreachable decision key keeps items escrowed (never
+-- guesses), resolution that would overwrite changed data is held for review, a first
+-- writer decides races, big trades are refused, and Update waits for a trade.
 local T = require("@mock/testkit")
 local Sim = require("@mock/sim")
 
@@ -26,88 +27,80 @@ local function swap(da, db)
 	db.Items.Sword, da.Items.Sword = da.Items.Sword, nil
 end
 
-local function queued(key, id)
-	for _, u in Sim.peek("Main", key).GlobalUpdates[2] do
-		if type(u[2]) == "table" and u[2].AnchorTx == id then
-			return true
-		end
-	end
-	return false
-end
-
-T.test("B offline with 1000+ queued messages: the trade message is pushed out, A resends, no loss", function()
-	Sim.configure({ latency = 0.01 })
-	local filler = {}
-	for i = 1, 1000 do
-		filler[i] = { i, { Note = i } }
-	end
-	seed("A", { Coins = 500, Items = { Sword = true } })
-	seed("B", { Coins = 50, Items = { Gem = true } }, filler)
-	local s1 = Sim.newServer({ JobId = "S1" })
-	local Anchor = anchor(s1)
-	local store = Anchor.New("Main", TEMPLATE)
-	local A = s1:await(store.StartSessionAsync, store, "A")
-	local B = s1:await(store.StartSessionAsync, store, "B")
-	local job = s1:spawn(Anchor.Trade, A, B, swap)
-	B:EndSession() -- B leaves during the commit
-	T.expect(Sim.awaitJobs({ job }, 60))
-	T.eq(job:result(), true)
-	local id = next(A.anchor_meta.Tx)
-	T.expect(Sim.runUntil(function()
-		return queued("B", id)
-	end, 30), "sent to B's queue")
-	T.eq(#Sim.peek("Main", "B").GlobalUpdates[2], 1000, "queue at its cap")
-
-	-- 1000 more messages arrive while B is offline: the oldest (ours among them) drop off
-	local s2 = Sim.newServer({ JobId = "SPAM" })
-	local spam = anchor(s2).New("Main", TEMPLATE)
-	local spammer = s2:spawn(function()
-		for i = 1, 1000 do
-			spam:MessageAsync("B", { Spam = i })
-		end
-	end)
-	local dropped = false
-	T.expect(Sim.runUntil(function()
-		dropped = dropped or not queued("B", id)
-		return spammer.done
-	end, 3000))
-	T.expect(dropped, "the trade message was pushed out of B's queue")
-	T.expect(A.anchor_meta.Tx ~= nil and A.anchor_meta.Tx[id] ~= nil, "A still holds the record")
-	T.expect(Sim.runUntil(function()
-		return queued("B", id)
-	end, 700), "A re-read B's key and resent")
-
-	-- B comes back: applied exactly once, A's record goes away
-	local s3 = Sim.newServer({ JobId = "S3" })
-	local st3 = anchor(s3).New("Main", TEMPLATE)
-	local B3 = s3:await(st3.StartSessionAsync, st3, "B")
-	T.eq(B3.Data.Coins, 150)
-	T.deepEq(B3.Data.Items, { Sword = true })
-	T.eq(s3:await(B3.SaveAsync, B3), true)
-	T.expect(Sim.runUntil(function()
-		return A.anchor_meta.Tx == nil
-	end, 700))
-	T.eq(A.Data.Coins, 400)
-	T.deepEq(A.Data.Items, { Gem = true })
-	B3:EndSession()
-	Sim.advance(5)
-	local B4 = s3:await(st3.StartSessionAsync, st3, "B")
-	T.eq(B4.Data.Coins, 150, "not applied twice")
-end)
-
--- A's server dies right after A's intent landed (B never got its side).
-local function crashAfterIntent()
+local function setup()
 	seed("A", { Coins = 500, Items = { Sword = true } })
 	seed("B", { Coins = 50, Items = { Gem = true } })
-	local s1 = Sim.newServer({ JobId = "S1" })
-	local Anchor = anchor(s1)
+	local s = Sim.newServer({ JobId = "S1" })
+	local Anchor = anchor(s)
 	local store = Anchor.New("Main", TEMPLATE)
-	local A = s1:await(store.StartSessionAsync, store, "A")
-	local B = s1:await(store.StartSessionAsync, store, "B")
+	local A = s:await(store.StartSessionAsync, store, "A")
+	local B = s:await(store.StartSessionAsync, store, "B")
+	return s, Anchor, store, A, B
+end
+
+T.test("decision key unreachable: Pending, items stay escrowed (unspendable), then it resolves itself", function()
+	local s, Anchor, store, A, B = setup()
+	local errors = {}
+	Anchor.OnError:Connect(function(m)
+		table.insert(errors, m)
+	end)
+	local rule = Sim.injectError({ method = "UpdateAsync", store = "AnchorTx" })
+	local ok, reason = s:await(Anchor.Trade, A, B, swap)
+	T.eq(ok, false)
+	T.eq(reason, "Pending")
+	T.eq(A.Data.Items.Sword, nil, "A's sword escrowed")
+	T.eq(B.Data.Items.Gem, nil, "B's gem escrowed")
+	T.eq(A.Data.Coins, 400)
+	T.expect(#errors >= 1 and string.find(errors[1], "unreachable", 1, true), T.show(errors))
+	local pending = store:PendingTrades(A)
+	T.eq(#pending, 1)
+	T.eq(pending[1].Role, "A")
+	Sim.advance(60)
+	T.expect(A.anchor_meta.Tx ~= nil, "still escrowed while the key is down")
+	rule:remove()
+	T.expect(Sim.runUntil(function()
+		return A.anchor_meta.Tx == nil and B.anchor_meta.Tx == nil
+	end, 200))
+	T.eq(A.Data.Items.Gem, true, "both escrows had landed: committed")
+	T.eq(B.Data.Items.Sword, true)
+	T.eq(A.Data.Coins + B.Data.Coins, 550)
+end)
+
+T.test("a side loading elsewhere races the decision: one stored decision, both sides follow it", function()
+	local s, Anchor, _, A, B = setup()
+	Sim.configure({ latency = { 1, 1 } })
+	local job = s:spawn(Anchor.Trade, A, B, swap)
+	Sim.advance(0.2)
+	B:EndSession()
+	local s2 = Sim.newServer({ JobId = "S2" })
+	local st2 = anchor(s2).New("Main", TEMPLATE)
+	-- Pre-empt: S2 loads B and resolves with "abort" if it reaches the key first.
+	local bjob = s2:spawn(st2.StartSessionAsync, st2, "B")
+	T.expect(Sim.awaitJobs({ job, bjob }, 120))
+	local B2 = bjob:result()
+	T.expect(Sim.runUntil(function()
+		return B2.anchor_meta.Tx == nil
+	end, 60))
+	local ok = job:result()
+	local decision = Sim.peek("AnchorTx", Sim.keys("AnchorTx")[1]).D
+	T.eq(ok, decision == "commit", "the trading server reports the stored decision")
+	Sim.advance(5)
+	local total = A.Data.Coins + B2.Data.Coins
+	T.eq(total, 550)
+	local gems = (if A.Data.Items.Gem then 1 else 0) + (if B2.Data.Items.Gem then 1 else 0)
+	local swords = (if A.Data.Items.Sword then 1 else 0) + (if B2.Data.Items.Sword then 1 else 0)
+	T.eq(gems, 1)
+	T.eq(swords, 1)
+end)
+
+T.test("resolution that would overwrite migrated data is held: OnError + PendingTrades, record kept", function()
+	T.allowThreadErrors()
+	local s, Anchor, _, A, B = setup()
+	-- crash right after the commit decision: both records survive in the saves
 	local armed = true
-	local rule = Sim.injectError({
+	Sim.injectError({
 		method = "UpdateAsync",
-		key = "A",
+		store = "AnchorTx",
 		when = function(info)
 			if armed then
 				armed = false
@@ -116,75 +109,73 @@ local function crashAfterIntent()
 			return false
 		end,
 	})
-	s1:spawn(Anchor.Trade, A, B, swap)
+	s:spawn(Anchor.Trade, A, B, swap)
 	Sim.advance(5)
-	rule:remove()
-	T.allowThreadErrors()
-	local raw = Sim.peek("Main", "A")
-	local id = next(raw.MetaData.Anchor.Tx)
-	return raw, id
-end
+	-- B's Coins were migrated to a table before B comes back (B's incoming has Inc Coins)
+	local raw = Sim.peek("Main", "B")
+	raw.Data.Coins = { Amount = 50 }
+	Sim.poke("Main", "B", raw)
+	local s2 = Sim.newServer({ JobId = "S2" })
+	local An2 = anchor(s2)
+	local st2 = An2.New("Main", TEMPLATE)
+	local errors = {}
+	An2.OnError:Connect(function(m)
+		table.insert(errors, m)
+	end)
+	local B2 = s2:awaitFor(300, st2.StartSessionAsync, st2, "B")
+	Sim.advance(10)
+	T.expect(B2.anchor_meta.Tx ~= nil, "record kept")
+	T.eq(type(B2.Data.Coins), "table", "migrated value never replaced")
+	T.eq(B2.Data.Items.Sword, nil, "nothing of the record applied (all or nothing)")
+	T.expect(#errors >= 1 and string.find(errors[#errors], "NEEDS MANUAL REVIEW", 1, true), T.show(errors))
+	local pending = st2:PendingTrades(B2)
+	T.eq(pending[1].Status, "NeedsReview")
+	T.expect(#pending[1].Incoming > 0)
+end)
 
-local function loadOnNewServer(key)
-	local s = Sim.newServer()
+T.test("B with 1000+ queued messages: the trade does not use the queue and lands once", function()
+	local filler = {}
+	for i = 1, 1000 do
+		filler[i] = { i, { Note = i } }
+	end
+	seed("A", { Coins = 500, Items = { Sword = true } })
+	seed("B", { Coins = 50, Items = { Gem = true } }, filler)
+	local s = Sim.newServer({ JobId = "S1" })
 	local Anchor = anchor(s)
 	local store = Anchor.New("Main", TEMPLATE)
-	local errors = {}
-	Anchor.OnError:Connect(function(message)
-		table.insert(errors, message)
-	end)
-	local p = s:awaitFor(300, store.StartSessionAsync, store, key)
-	return s, store, p, errors
-end
-
-T.test("a leftover record older than B's Applied window is not resent: OnError + PendingTrades", function()
-	local raw, id = crashAfterIntent()
-	raw.MetaData.Anchor.Tx[id].t -= 91 * 24 * 3600
-	Sim.poke("Main", "A", raw)
-	local _, store, A, errors = loadOnNewServer("A")
-	Sim.advance(30)
-	T.eq(#Sim.peek("Main", "B").GlobalUpdates[2], 0, "nothing resent")
-	T.expect(#errors >= 1 and string.find(errors[#errors], "NEEDS MANUAL REVIEW", 1, true), T.show(errors))
-	local pending = store:PendingTrades(A)
-	T.eq(#pending, 1)
-	T.eq(pending[1].Id, id)
-	T.eq(pending[1].Key, "B")
-	T.eq(pending[1].Status, "NeedsReview")
-	T.expect(type(pending[1].Patch) == "table" and #pending[1].Patch > 0)
-	-- kept across saves and later loads; still not resent
-	A:EndSession()
-	Sim.advance(5)
-	T.expect(Sim.peek("Main", "A").MetaData.Anchor.Tx[id] ~= nil, "record kept in A's save")
-	local _, _, _, errors2 = loadOnNewServer("A")
-	Sim.advance(30)
-	T.eq(#Sim.peek("Main", "B").GlobalUpdates[2], 0)
-	T.expect(#errors2 >= 1)
-end)
-
-T.test("B forgot applied ids newer than the record (trimmed): no resend, review instead", function()
-	local _, id = crashAfterIntent()
-	local rawB = Sim.peek("Main", "B")
-	rawB.MetaData.Anchor = { AppliedFloor = Sim.unixTime() } -- B trimmed entries up to now
-	Sim.poke("Main", "B", rawB)
-	local _, store, A, errors = loadOnNewServer("A")
-	Sim.advance(30)
-	T.eq(#Sim.peek("Main", "B").GlobalUpdates[2], 0)
-	T.expect(#errors >= 1 and string.find(errors[#errors], "NEEDS MANUAL REVIEW", 1, true), T.show(errors))
-	T.eq(store:PendingTrades(A)[1].Id, id)
-end)
-
-T.test("a fresh leftover record whose B never applied it is resent and lands once", function()
-	local _, id = crashAfterIntent()
-	local s, _, A = loadOnNewServer("A")
-	T.expect(Sim.runUntil(function()
-		return queued("B", id)
-	end, 30))
-	local store = anchor(s).New("Main", TEMPLATE)
+	local A = s:await(store.StartSessionAsync, store, "A")
 	local B = s:await(store.StartSessionAsync, store, "B")
-	T.eq(B.Data.Coins, 150)
+	Sim.configure({ latency = { 1, 1 } })
+	local job = s:spawn(Anchor.Trade, A, B, swap)
+	Sim.advance(0.2)
+	B:EndSession()
+	T.expect(Sim.awaitJobs({ job }, 60))
+	T.eq(job:result(), true)
+	Sim.advance(5)
+	T.eq(#Sim.peek("Main", "B").GlobalUpdates[2], 1000)
+	local s2 = Sim.newServer({ JobId = "S2" })
+	local st2 = anchor(s2).New("Main", TEMPLATE)
+	local B2 = s2:await(st2.StartSessionAsync, st2, "B")
 	T.expect(Sim.runUntil(function()
-		return A.anchor_meta.Tx == nil
-	end, 60))
+		return B2.anchor_meta.Tx == nil
+	end, 30))
+	T.eq(B2.Data.Coins, 150)
+	T.deepEq(B2.Data.Items, { Sword = true })
+end)
+
+T.test("a trade that would push a side over the size limit is refused with nothing changed", function()
+	local s, Anchor, _, A, B = setup()
+	A.Data.Items.Statue = string.rep("x", 2100000)
+	B.Data.Items.Filler = string.rep("y", 2100000)
+	local ok, reason = s:await(Anchor.Trade, A, B, function(da, db)
+		db.Items.Statue, da.Items.Statue = da.Items.Statue, nil
+		da.Coins += 1
+		db.Coins -= 1
+	end)
+	T.eq(ok, false)
+	T.eq(reason, "TooBig")
+	T.expect(A.Data.Items.Statue ~= nil)
+	T.eq(A.anchor_meta.Tx, nil)
 end)
 
 T.test("Data:Update on a trading profile waits for the trade; IsTrading is true meanwhile", function()

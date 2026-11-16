@@ -44,7 +44,7 @@ local function setup()
 	return s, Anchor, store, A, B
 end
 
-T.test("happy path: both sides change, both saved, tx record cleared, B applied once", function()
+T.test("happy path: both sides change, both saved, escrow records cleared, decision committed", function()
 	local s, Anchor, _, A, B = setup()
 	local ok, reason = s:await(Anchor.Trade, A, B, swap)
 	T.eq(ok, true, tostring(reason))
@@ -57,13 +57,10 @@ T.test("happy path: both sides change, both saved, tx record cleared, B applied 
 	T.eq(ra.Data.Coins, 400)
 	T.eq(rb.Data.Coins, 150)
 	T.deepEq(rb.Data.Items, { Sword = { Level = 3 } })
-	T.eq(ra.MetaData.Anchor, nil, "A's tx record dropped after B confirmed")
-	T.expect(type(rb.MetaData.Anchor.Applied) == "table", "B remembers the applied tx")
-	local n = 0
-	for _ in rb.MetaData.Anchor.Applied do
-		n += 1
-	end
-	T.eq(n, 1)
+	T.eq(ra.MetaData.Anchor, nil, "A's escrow record resolved and dropped")
+	T.eq(rb.MetaData.Anchor, nil, "B's escrow record resolved and dropped")
+	local decision = Sim.peek("AnchorTx", Sim.keys("AnchorTx")[1])
+	T.eq(decision.D, "commit", "one neutral decision key, written once")
 end)
 
 T.test("fn returns false -> Cancelled, fn errors -> Error; nothing changes or saves", function()
@@ -215,49 +212,46 @@ T.test("player leaves while fn runs -> Inactive, nothing changes", function()
 	T.eq(B.Data.Coins, 50)
 end)
 
-T.test("B leaves mid-trade: PB goes through B's message queue and is applied on B's next load", function()
+T.test("B leaves mid-trade: B's release carries the escrow; B gets its side when it loads elsewhere", function()
 	local s, Anchor, store, A, B = setup()
 	Sim.configure({ latency = { 1, 1 } })
 	local job = s:spawn(Anchor.Trade, A, B, swap)
-	Sim.advance(0.2)
+	Sim.advance(0.2) -- both escrow saves are in flight
 	B:EndSession()
 	T.expect(Sim.awaitJobs({ job }, 60))
-	T.eq(job:result(), true)
+	T.eq(job:result(), true, "both escrows landed: committed")
 	Sim.advance(10)
 	local rb = Sim.peek("Main", "B")
-	T.eq(rb.Data.Coins, 50, "B released before the patch arrived")
-	T.eq(#rb.GlobalUpdates[2], 1, "patch waits in B's queue")
-	T.expect(A.anchor_meta.Tx ~= nil, "A keeps its record until B has applied it")
-	-- B joins another server: applied at load, exactly once
+	T.eq(rb.Data.Coins, 50, "B's incoming side not applied yet")
+	T.eq(rb.Data.Items.Gem, nil, "B's outgoing gem is in escrow, unspendable")
+	T.expect(rb.MetaData.Anchor.Tx ~= nil, "B's save carries the escrow record")
+	T.eq(Sim.peek("Main", "A").MetaData.Anchor, nil, "A resolved on this server")
 	local s2 = Sim.newServer({ JobId = "S2" })
 	local st2 = anchor(s2).New("Main", TEMPLATE)
 	local B2 = load(s2, st2, "B")
+	T.expect(Sim.runUntil(function()
+		return B2.anchor_meta.Tx == nil
+	end, 30))
 	T.eq(B2.Data.Coins, 150)
 	T.deepEq(B2.Data.Items, { Sword = { Level = 3 } })
 	B2:EndSession()
 	Sim.advance(5)
-	T.expect(Sim.runUntil(function()
-		return A.anchor_meta.Tx == nil
-	end, 400), "A re-read B's key, saw Applied, dropped the record")
-	Sim.advance(5)
-	T.eq(Sim.peek("Main", "A").MetaData.Anchor, nil)
 	local B3 = load(s2, st2, "B")
+	Sim.advance(5)
 	T.eq(B3.Data.Coins, 150, "not applied twice")
-	T.eq(#Sim.peek("Main", "B").GlobalUpdates[2], 0)
 	local _ = store
 end)
 
-T.test("redo onto newer B data keeps B's progress (increments, per-key sets)", function()
+T.test("crash right after the commit decision: each side applies its incoming on next load, on top of progress", function()
 	local s, Anchor, _, A, B = setup()
-	-- Crash right after A's intent landed: B never got its side on this server.
 	local armed = true
 	Sim.injectError({
 		method = "UpdateAsync",
-		key = "A",
+		store = "AnchorTx",
 		when = function(info)
 			if armed then
 				armed = false
-				info.server:crash()
+				info.server:crash() -- the decision commits, the server never applies it
 			end
 			return false
 		end,
@@ -266,33 +260,34 @@ T.test("redo onto newer B data keeps B's progress (increments, per-key sets)", f
 	Sim.advance(5)
 	T.expect(not s.alive)
 	T.allowThreadErrors()
+	T.eq(Sim.peek("AnchorTx", Sim.keys("AnchorTx")[1]).D, "commit")
 
-	-- B plays on S2 first and makes progress
+	-- B plays on S2 and makes progress
 	local s2 = Sim.newServer({ JobId = "S2" })
 	local st2 = anchor(s2).New("Main", TEMPLATE)
 	local B2 = load(s2, st2, "B")
-	T.eq(B2.Data.Coins, 50)
+	T.expect(Sim.runUntil(function()
+		return B2.anchor_meta.Tx == nil
+	end, 30))
+	T.eq(B2.Data.Coins, 150)
 	B2.Data.Coins += 1000
 	B2.Data.Items.Shield = true
 	table.insert(B2.Data.Bag, "melon")
 	T.eq(s2:await(B2.SaveAsync, B2), true)
 
-	-- A comes back on S3: recovery redelivers PB to B (on S2) through MessagingService
+	-- A comes back on S3 much later
+	Sim.advance(100)
 	local s3 = Sim.newServer({ JobId = "S3" })
 	local st3 = anchor(s3).New("Main", TEMPLATE)
 	local A3 = load(s3, st3, "A")
-	T.eq(A3.Data.Coins, 400)
-	T.expect(Sim.runUntil(function()
-		return B2.Data.Coins ~= 1050
-	end, 30), "patch reached B")
-	T.eq(B2.Data.Coins, 1150, "increment on top of progress")
-	T.deepEq(B2.Data.Items, { Shield = true, Sword = { Level = 3 } })
-	T.deepEq(B2.Data.Bag, { "pear", "melon" })
-	Sim.advance(20)
-	T.expect(A3.anchor_meta.Tx ~= nil, "applied in B's memory only: A keeps its record")
 	T.expect(Sim.runUntil(function()
 		return A3.anchor_meta.Tx == nil
-	end, 700), "cleared after B's save with Applied landed and A re-read it")
+	end, 30))
+	T.eq(A3.Data.Coins, 400)
+	T.deepEq(A3.Data.Items, { Gem = { Shiny = true } })
+	T.eq(B2.Data.Coins, 1150)
+	T.deepEq(B2.Data.Items, { Shield = true, Sword = { Level = 3 } })
+	T.deepEq(B2.Data.Bag, { "pear", "melon" })
 end)
 
 T.test("live proxies: writes go through the proxy; a rejected field falls back to the plain table", function()
@@ -339,7 +334,7 @@ T.test("live proxies: writes go through the proxy; a rejected field falls back t
 	T.eq(Sim.peek("Main", "A").Data.Coins, 400)
 end)
 
-T.test("Gift: online elsewhere, offline, and idempotent with an Id", function()
+T.test("Gift: online elsewhere and offline, each gift applied once", function()
 	local s1 = Sim.newServer({ JobId = "S1" })
 	local s2 = Sim.newServer({ JobId = "S2" })
 	local D1 = anchor(s1).new("Main", TEMPLATE)
@@ -359,16 +354,16 @@ T.test("Gift: online elsewhere, offline, and idempotent with an Id", function()
 	end, 30))
 	T.eq(prof.Data.Items.Hat, true)
 
-	-- the same Id twice: once
+	-- two separate gifts: each applied exactly once
 	for _ = 1, 2 do
-		T.eq(s1:await(D1.Gift, D1, 5, { { "Inc", { "Coins" }, 1 } }, { Id = "login-bonus" }), true)
+		T.eq(s1:await(D1.Gift, D1, 5, { { "Inc", { "Coins" }, 1 } }), true)
 	end
 	-- (owner pings within 6 s of each other are coalesced by stock; the autosave picks it up)
 	T.expect(Sim.runUntil(function()
-		return prof.Data.Coins ~= 107
+		return prof.Data.Coins == 109
 	end, 400))
 	Sim.advance(30)
-	T.eq(prof.Data.Coins, 108)
+	T.eq(prof.Data.Coins, 109)
 
 	-- offline player (never joined): delivered on first join
 	T.eq(s1:await(D1.Gift, D1, 9, function(data)
@@ -379,7 +374,7 @@ T.test("Gift: online elsewhere, offline, and idempotent with an Id", function()
 	T.eq(qp.Data.Coins, 5)
 end)
 
-T.test("A's intent save keeps failing while A is active -> SaveFailed, undone in memory", function()
+T.test("A's escrow save keeps failing while A is active -> SaveFailed, undone in memory", function()
 	local s, Anchor, _, A, B = setup()
 	local rule = Sim.injectError({ method = "UpdateAsync", key = "A" })
 	local ok, reason = s:await(Anchor.Trade, A, B, swap)
@@ -398,19 +393,26 @@ T.test("A's intent save keeps failing while A is active -> SaveFailed, undone in
 	T.eq(B.Data.Coins, 150)
 end)
 
-T.test("A's intent save fails, then A leaves: the release save carries the tx and the trade lands", function()
-	local s, Anchor, _, A, B = setup()
+T.test("A's escrow save fails, then A leaves: aborted, both sides refunded (A on its next load)", function()
+	local s, Anchor, store, A, B = setup()
 	local rule = Sim.injectError({ method = "UpdateAsync", key = "A", count = 1 })
 	local job = s:spawn(Anchor.Trade, A, B, swap)
-	Sim.advance(0.5) -- first attempt failed, trade is backing off
+	Sim.advance(0.5) -- first escrow attempt failed, backing off
 	T.eq(rule.hits, 1)
 	A:EndSession()
 	T.expect(Sim.awaitJobs({ job }, 60))
-	T.eq(job:result(), true)
+	local ok, reason = job:result()
+	T.eq(ok, false)
+	T.eq(reason, "SessionLost")
+	T.eq(B.Data.Coins, 50)
+	T.deepEq(B.Data.Items, { Gem = { Shiny = true } }, "B refunded at once")
 	Sim.advance(5)
-	T.eq(Sim.peek("Main", "A").Data.Coins, 400)
-	T.eq(Sim.peek("Main", "B").Data.Coins, 150)
-	T.eq(B.Data.Coins, 150)
+	local A2 = load(s, store, "A")
+	T.expect(Sim.runUntil(function()
+		return A2.anchor_meta.Tx == nil
+	end, 30))
+	T.eq(A2.Data.Coins, 500)
+	T.deepEq(A2.Data.Items, { Sword = { Level = 3 } }, "A refunded when it loaded")
 end)
 
 T.test("A's session is stolen before any write of the trade lands -> SessionLost, nothing changed", function()

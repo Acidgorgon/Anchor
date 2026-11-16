@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-	Anchor / Trade - dupe-proof, loss-proof trades and gifts (docs/design/spec.md section 4).
+	Anchor / Trade - two-phase escrow trades and exactly-once gifts (docs/SPEC.md section 4).
 
 	USAGE
 		local ok, reason = Anchor.Trade(Data:Get(a), Data:Get(b), function(da, db)
@@ -12,73 +12,74 @@
 		end)
 
 		Data:Gift(userId, function(data) data.Coins += 50 end)   -- online anywhere or offline
-		Data:Gift(userId, fn, { Id = "event_2026_login" })       -- Id: at most once per player
 
 	RESULT (what the game should show)
-		true                    Trade done. Both sides have their new data now (or, if B left
-		                        mid-trade, B gets it on whichever server loads B next). Show "Trade
-		                        complete".
+		true                    Committed: both sides have their new data now (a side that left
+		                        mid-trade gets its incoming items when it next loads).
 		false, "Cancelled"      fn returned false. Nothing changed.
-		false, "Error", msg     fn errored. Nothing changed. Show "Trade failed".
-		false, "Invalid", msg   Bad arguments, same profile twice, view-mode profile, or the
-		                        drafts hold values a DataStore can't store. Nothing changed.
-		false, "Inactive"       A or B is not loaded on this server (left / not loaded yet).
-		false, "Busy"           Another trade on A or B did not finish within opts.Timeout.
-		false, "SaveFailed"     A's save kept failing (DataStore outage). The trade was undone;
-		                        nothing changed. Show "Trade failed, try again".
-		false, "SessionLost"    A's session ended mid-commit and no write of the trade could be
-		                        confirmed. Usually nothing changed; if the trade did reach A's
-		                        save, it completes on its own when A is next loaded. Either way
-		                        no item is duplicated or lost.
+		false, "Error", msg     fn (or the trade) errored. Nothing changed.
+		false, "Invalid", msg   Bad arguments, same profile twice, view-mode profile, or the drafts
+		                        hold values a DataStore can't store. Nothing changed.
+		false, "Inactive"       A or B is not loaded on this server. Nothing changed.
+		false, "Busy"           Another trade on A or B did not finish within opts.Timeout (30 s).
+		false, "TooBig"         A side would exceed the DataStore's 4 MB value limit. Nothing changed.
+		false, "SaveFailed"     An escrow save failed; the trade was aborted and refunded.
+		false, "SessionLost"    A side left / lost its session before its escrow saved; aborted.
+		false, "Aborted"        Another server resolved the trade first (it aborted); refunded.
+		false, "Pending"        The decision key could not be reached. Traded items stay in escrow
+		                        (unspendable) and the trade resolves itself (commit or refund) as
+		                        soon as the key is reachable. Show "Trade pending".
+		Every abort refunds both sides. Nothing is ever duplicated or lost.
 
-	PROTOCOL
-		1. Lock A and B (one trade at a time per profile; later trades QUEUE, up to
-		   opts.Timeout = 30 s, then "Busy"). Queued trades run fn on fresh data.
-		2. fn(draftA, draftB) on deep copies, in a pcall. Diff drafts -> patches PA, PB.
-		3. Same tick: apply PA to live A and add A.MetaData.Anchor.Tx[id] = {peer, patch=PB, t}.
-		   Force-save A (up to 3 tries). This write is the durable intent.
-		   - Not saved and A still active: undo PA and the Tx record -> "SaveFailed".
-		   - A's session ended: wait for its release save (it carries the Tx) -> true when it
-		     lands, else "SessionLost".
-		4. Once a write of A containing Tx[id] (with its creation time t) has landed
-		   (AfterSave hook): deliver PB. B active here: apply PB to live B +
-		   B.MetaData.Anchor.Applied[id] in the same tick, force-save B. Otherwise read B's
-		   key (GetAsync, read-only) and send {AnchorTx = id, Patch = PB} to B's queue only if
-		   B hasn't applied it and it isn't already queued; whichever server owns B applies
-		   it once (Applied dedup).
-		5. A drops Tx[id] only when B HAS APPLIED it: B's save with Applied[id] landed on
-		   this server, or a read of B's key shows Applied[id]. While waiting, A re-reads B's
-		   key (10 s, doubling to 5 min) and resends if the message vanished (e.g. B's queue
-		   overflowed its 1000-message cap).
-		6. Recovery: a profile that loads with Tx records resumes step 4-5 (read first).
-		   B forgets Applied ids after 90 days / beyond 2000 entries and keeps the newest
-		   forgotten time in Applied floor (MetaData.Anchor.AppliedFloor). A record that is
-		   neither applied nor queued but older than that window (or than B's floor) is NOT
-		   resent: a resend could duplicate. It is kept, OnError fires ("NEEDS MANUAL
-		   REVIEW"), and store:PendingTrades(profile) lists it.
+	PROTOCOL (two-phase escrow, one neutral decision key per trade)
+		1. ONE tick, no yield: fn(draftA, draftB) on copies; diff -> each side's patch split into
+		   OUTGOING (Remove, Pull, negative Inc) and INCOMING (Set, Push, positive Inc). Outgoing
+		   is applied to both live profiles immediately and each side gets
+		   MetaData.Anchor.Tx[id] = {role, refund = inverse of outgoing, incoming, peer, t}.
+		   From here the traded items can't be spent, and every save of either side (autosave,
+		   release on leave, shutdown) carries the escrow.
+		2. Save A and B in parallel (2 tries each). Both landed -> "commit", else "abort".
+		3. The decision: UpdateAsync on DataStore "AnchorTx", key "tx_<id>": first writer wins
+		   (empty -> write mine, else adopt the stored one). This is the single commit point.
+		4. Each side still loaded here: commit -> apply incoming, abort -> apply refund, and
+		   drop its Tx record in the SAME tick; then save. A record present == unresolved, so
+		   resolution is idempotent (no applied-id sets, nothing to prune).
+		5. Recovery: a profile that loads with a Tx record resolves it through step 3 with
+		   "abort" as its proposal (safe: "commit" is only ever written after both escrows
+		   landed). If the key can't be reached the record stays (items stay escrowed),
+		   OnError fires, and it retries with backoff; it never guesses.
+		6. Before step 1's tick ends nothing is written; if either side's escrow or committed
+		   size estimate exceeds the limit the trade is refused ("TooBig"). Resolution onto
+		   changed data: missing parents are recreated; an Inc onto a non-number (or a write
+		   below a non-table) is never forced: the record is kept, OnError says NEEDS MANUAL
+		   REVIEW, and store:PendingTrades(profile) lists it.
 
-	While a trade commits, profile:IsTrading() is true and Data:Update(player, fn) waits
-	for it to finish. Direct writes to profile.Data in that window (~1 save) can still race:
-	route writes through Data:Update, or check IsTrading().
+	While a trade commits, profile:IsTrading() is true and Data:Update(player, fn) waits for
+	it. Direct writes to profile.Data in that window (~1-2 saves) can still race.
+
+	Gifts ride the profile's message queue: the patch is applied when the owner processes the
+	message, and the stock "processed" removal lands in the same save as the data, so each
+	message applies exactly once. Gift patches never recreate a parent the player no longer
+	has (a sold pet doesn't come back as a stub) unless the template defines it.
 
 	Live proxies: opts.Live = {liveA, liveB} (Ripple states wrapping profile.Data in place),
-	or the states from store:UseRipple(). Patches are applied through them; a write the proxy
-	rejects is written to the plain table instead and Anchor.OnError fires.
+	or the states from store:UseRipple(). A proxy write that errors is written to the plain
+	table instead and Anchor.OnError fires.
 --]]
 
 local TX_LOCK_TIMEOUT = 30
-local INTENT_SAVE_ATTEMPTS = 3
-local APPLIED_MAX_AGE = 90 * 24 * 60 * 60 -- B forgets applied tx ids after this...
-local APPLIED_MAX_COUNT = 2000 -- ...or beyond this many (oldest first)
-local CLOCK_MARGIN = 60 * 60 -- server clocks may disagree; ambiguity is judged with this slack
-local RECHECK_FIRST = 10 -- (Seconds) first re-read of B's key while waiting for B to apply
-local RECHECK_MAX = 300
+local ESCROW_SAVE_ATTEMPTS = 2
+local DECISION_STORE = "AnchorTx"
+local DECISION_WAIT = 10 -- (Seconds) Trade waits this long for the decision key before "Pending"
+local RETRY_MAX = 60
+local SIZE_LIMIT = 4000000 -- bytes; Roblox's limit is 4 MB per key, leave room for the envelope
 
 local Trade = {}
 
 function Trade.install(Anchor, Core)
 	local Patch = require(script.Parent.Patch)
 	local HttpService = game:GetService("HttpService")
+	local DataStoreService = game:GetService("DataStoreService")
 	local OnError = Anchor.OnError
 
 	local function report(profile, message)
@@ -98,10 +99,10 @@ function Trade.install(Anchor, Core)
 	end
 
 	local function newId(): string
-		return HttpService:GenerateGUID(false)
+		return (string.gsub(HttpService:GenerateGUID(false), "-", ""))
 	end
 
-	-- Per-profile in-memory tx state: [id] = "pending" | "durable" | "delivering"
+	-- In-memory per-profile state: [id] = "resolving" | "review"
 	local function txState(profile)
 		local state = rawget(profile, "_anchor_tx_state")
 		if state == nil then
@@ -111,266 +112,169 @@ function Trade.install(Anchor, Core)
 		return state
 	end
 
-	-- Live proxies passed to Anchor.Trade for B, kept until the patch is applied.
-	local PendingLive = setmetatable({}, { __mode = "v" })
+	----- Decision key -----
 
-	----- Store lookup (for delivering to B by name) -----
+	-- Mock profiles / no DataStore access: decisions live in this server's memory (like the
+	-- mock profiles themselves). Entries are dropped once both sides resolved here.
+	local MemDecisions = {}
 
-	local function storeFor(peer)
-		local name = peer[1]
-		local stores = Anchor._stores
-		local store = stores ~= nil and stores[name] or nil
-		if store == nil then
-			store = Anchor.New(name, {})
-		end
-		return store
+	local function usesMemory(rec): boolean
+		return rec.mock == true or Anchor.DataStoreState ~= "Access"
 	end
 
-	----- B side: apply a patch once -----
-
-	-- Forgets old Applied entries. meta.AppliedFloor = the newest applied-time ever
-	-- forgotten: a tx created before it may have been applied and forgotten, so a redo of
-	-- such a tx is ambiguous (see checkPeer).
-	local function pruneApplied(meta, applied)
-		local now = os.time()
-		local floor = if type(meta.AppliedFloor) == "number" then meta.AppliedFloor else 0
-		local entries = {}
-		for id, t in next, applied do
-			if type(t) ~= "number" then
-				applied[id] = nil
-				floor = math.max(floor, now)
-			elseif now - t > APPLIED_MAX_AGE then
-				applied[id] = nil
-				floor = math.max(floor, t)
-			else
-				table.insert(entries, { id, t })
+	-- First writer wins. Returns "commit" | "abort", or nil when the key can't be reached.
+	local function decide(rec, id, mine)
+		if usesMemory(rec) then
+			local d = MemDecisions[id]
+			if d == nil then
+				d = mine
+				MemDecisions[id] = d
 			end
+			return d
 		end
-		if #entries > APPLIED_MAX_COUNT then
-			table.sort(entries, function(a, b)
-				return a[2] < b[2]
+		local adopted
+		local ok = pcall(function()
+			local ds = DataStoreService:GetDataStore(DECISION_STORE)
+			ds:UpdateAsync("tx_" .. id, function(old)
+				adopted = nil
+				if type(old) == "table" and (old.D == "commit" or old.D == "abort") then
+					adopted = old.D
+					return nil -- keep the stored decision
+				end
+				return { D = mine, T = os.time() }
 			end)
-			for i = 1, #entries - APPLIED_MAX_COUNT do
-				applied[entries[i][1]] = nil
-				floor = math.max(floor, entries[i][2])
+		end)
+		if ok ~= true then
+			return nil
+		end
+		return adopted or mine
+	end
+
+	----- Resolution -----
+
+	local function dropRecord(P, id)
+		local tx = P.anchor_meta.Tx
+		if type(tx) == "table" then
+			tx[id] = nil
+			if next(tx) == nil then
+				P.anchor_meta.Tx = nil
 			end
 		end
-		if floor > 0 then
-			meta.AppliedFloor = floor
+		txState(P)[id] = nil
+		P:MarkMetaDirty()
+	end
+
+	-- Applies the decision to P in one tick (ops + record removal). false = kept for review.
+	local function applyDecision(P, id, decision, live): boolean
+		local tx = P.anchor_meta.Tx
+		local rec = type(tx) == "table" and tx[id] or nil
+		if rec == nil then
+			return true
+		end
+		local ops = if decision == "commit" then rec.incoming else rec.refund
+		if type(ops) ~= "table" or Patch.check(ops) ~= true then
+			ops = nil
+		end
+		local problem = if ops ~= nil then Patch.conflict(P.Data, ops) else "record is malformed"
+		if problem ~= nil then
+			txState(P)[id] = "review"
+			report(
+				P,
+				`Anchor trade {id} ({decision}) NEEDS MANUAL REVIEW: {problem}. The record is kept and the `
+					.. `traded items stay in escrow; inspect with store:PendingTrades(profile).`
+			)
+			return false
+		end
+		Patch.apply(P.Data, ops, live or liveFor(P), reporter(P))
+		dropRecord(P, id)
+		local mem = rec.mock == true or Anchor.DataStoreState ~= "Access"
+		if mem then
+			local peer = rec.peer
+			local other = type(peer) == "table" and Core.GetActiveProfile({ Name = peer[1] }, peer[2], rec.mock == true)
+			local other_tx = other ~= nil and other.anchor_meta.Tx or nil
+			if type(other_tx) ~= "table" or other_tx[id] == nil then
+				MemDecisions[id] = nil -- both sides resolved
+			end
+		end
+		return true
+	end
+
+	-- Resolves P's record `id`, retrying the decision key with backoff while P is loaded
+	-- here. `mine` = this server's proposal ("abort" unless it saw both escrows land).
+	local function resolveLoop(P, id, mine, live)
+		local state = txState(P)
+		if state[id] == "resolving" or state[id] == "review" then
+			return
+		end
+		state[id] = "resolving"
+		local backoff = 1
+		local warned = false
+		while true do
+			local tx = P.anchor_meta.Tx
+			local rec = type(tx) == "table" and tx[id] or nil
+			if rec == nil or not P:IsActive() then
+				if state[id] == "resolving" then
+					state[id] = nil
+				end
+				return
+			end
+			local decision = decide(rec, id, mine)
+			if decision ~= nil then
+				state[id] = nil
+				if applyDecision(P, id, decision, live) then
+					P:SaveAsync()
+				end
+				return
+			end
+			if not warned then
+				warned = true
+				report(P, `Anchor trade {id}: decision key unreachable; items stay in escrow, retrying`)
+			end
+			task.wait(backoff)
+			backoff = math.min(RETRY_MAX, backoff * 2)
 		end
 	end
 
-	-- Applies `patch` to profile once per id. Returns true if it was applied now.
-	local function applyOnce(profile, id, patch, live): boolean
-		local meta = profile.anchor_meta
-		local applied = meta.Applied
-		if type(applied) ~= "table" then
-			applied = {}
-			meta.Applied = applied
+	Core.AddHook("Loaded", function(profile)
+		local tx = profile.anchor_meta.Tx
+		if type(tx) == "table" then
+			for id in next, tx do
+				task.spawn(resolveLoop, profile, id, "abort")
+			end
 		end
-		if applied[id] ~= nil then
-			return false
+	end)
+
+	----- Gifts: the message queue's own exactly-once -----
+
+	local function seenThisSession(profile)
+		local seen = rawget(profile, "_anchor_gifts_seen")
+		if seen == nil then
+			seen = {}
+			rawset(profile, "_anchor_gifts_seen", seen)
 		end
-		local ok_patch, problem = Patch.check(patch)
-		if ok_patch ~= true then
-			report(profile, `Anchor tx {id} has an invalid patch ({tostring(problem)}); not applied`)
-			return false
-		end
-		local _, missed = Patch.apply(profile.Data, patch, live or liveFor(profile), reporter(profile))
-		if missed > 0 then
-			report(profile, `Anchor tx {id}: {missed} array item(s) to remove were no longer there`)
-		end
-		applied[id] = os.time()
-		pruneApplied(meta, applied)
-		profile:MarkMetaDirty()
-		return true
+		return seen
 	end
 
 	Core.AddHook("Message", function(profile, message, processed)
 		if type(message) ~= "table" or type(message.AnchorTx) ~= "string" or type(message.Patch) ~= "table" then
 			return false -- not ours (or not well-formed): user handlers see it
 		end
-		applyOnce(profile, message.AnchorTx, message.Patch)
+		local seen = seenThisSession(profile)
+		if seen[message.AnchorTx] ~= true then
+			seen[message.AnchorTx] = true -- the same message queued twice applies once
+			local ok_patch, problem = Patch.check(message.Patch)
+			if ok_patch ~= true then
+				report(profile, `Anchor gift {message.AnchorTx} has an invalid patch ({tostring(problem)}); dropped`)
+			else
+				Patch.apply(profile.Data, message.Patch, liveFor(profile), reporter(profile), {
+					Parents = "template",
+					Template = profile.ProfileStore.template,
+				})
+				profile:MarkMetaDirty() -- this save must carry the change with the queue removal
+			end
+		end
 		processed()
 		return true
-	end)
-
-	----- A side: deliver a durable intent -----
-
-	local deliver
-
-	local function clearTx(A, id, rec)
-		local tx = A.anchor_meta.Tx
-		if type(tx) == "table" and tx[id] == rec then
-			tx[id] = nil
-			if next(tx) == nil then
-				A.anchor_meta.Tx = nil
-			end
-			A:MarkMetaDirty()
-		end
-		txState(A)[id] = nil
-		PendingLive[id] = nil
-		if A:IsActive() then
-			A:SaveAsync() -- drop the record now (a later save would do it too)
-		end
-	end
-
-	local function sendTx(peer, id, patch): boolean
-		local store = storeFor(peer)
-		local ok, accepted = pcall(function()
-			if peer[3] == true then
-				return store.Mock:MessageAsync(peer[2], { AnchorTx = id, Patch = patch })
-			end
-			return store:MessageAsync(peer[2], { AnchorTx = id, Patch = patch })
-		end)
-		return ok == true and accepted == true
-	end
-
-	-- Reads B's key (read-only) and says where tx `id` stands:
-	--   "applied"  B's saved state has Applied[id]               -> A may forget the record
-	--   "queued"   the message is still in B's saved queue        -> wait
-	--   "missing"  neither, and B can't have applied+forgotten it -> (re)send
-	--   "review"   neither, but B may have applied it and since forgotten it (pruned): a
-	--              resend could apply it twice -> keep the record, a human decides
-	--   "unknown"  the read failed (server closing, unreadable key) -> retry later
-	local function checkPeer(peer, id, rec): string
-		local store = storeFor(peer)
-		local ok, view = pcall(function()
-			if peer[3] == true then
-				return store.Mock:GetAsync(peer[2])
-			end
-			return store:GetAsync(peer[2])
-		end)
-		if ok ~= true or Anchor.IsClosing == true then
-			return "unknown"
-		end
-		if view == nil then
-			-- B's key holds no profile (it was loaded for the trade, so this is not normal).
-			return "review"
-		end
-		local meta = view.anchor_meta or {}
-		if type(meta.Applied) == "table" and meta.Applied[id] ~= nil then
-			return "applied"
-		end
-		for _, update in ipairs(view.global_updates or {}) do
-			local data = update[#update]
-			if type(data) == "table" and data.AnchorTx == id then
-				return "queued"
-			end
-		end
-		local created = if type(rec.t) == "number" then rec.t else 0
-		local floor = if type(meta.AppliedFloor) == "number" then meta.AppliedFloor else 0
-		if os.time() - created > APPLIED_MAX_AGE - CLOCK_MARGIN or floor >= created - CLOCK_MARGIN then
-			return "review"
-		end
-		return "missing"
-	end
-
-	-- Delivers A's durable intent `id` and keeps A's record until B has applied it: B's
-	-- save with Applied[id] landed on this server, or a read of B's key shows Applied[id].
-	deliver = function(A, id)
-		local tx = A.anchor_meta.Tx
-		local rec = type(tx) == "table" and tx[id] or nil
-		local state = txState(A)
-		if rec == nil or state[id] == "delivering" or state[id] == "review" then
-			return
-		end
-		state[id] = "delivering"
-
-		local peer, patch = rec.peer, rec.patch
-		if type(peer) ~= "table" or type(peer[1]) ~= "string" or type(peer[2]) ~= "string" then
-			state[id] = "review"
-			report(A, `Anchor tx {id} has an invalid peer; kept for manual review (store:PendingTrades(profile))`)
-			return
-		end
-
-		local wait_time = RECHECK_FIRST
-		while true do
-			if type(A.anchor_meta.Tx) ~= "table" or A.anchor_meta.Tx[id] ~= rec then
-				state[id] = nil
-				return
-			end
-			-- B loaded here: apply directly, confirmed by B's own save.
-			local B = Core.GetActiveProfile({ Name = peer[1] }, peer[2], peer[3] == true)
-			if B ~= nil and B:IsActive() and B.view_mode ~= true then
-				applyOnce(B, id, patch, PendingLive[id])
-				if B:SaveAsync() == true then
-					clearTx(A, id, rec)
-					return
-				end
-			end
-			local where = checkPeer(peer, id, rec)
-			if where == "applied" then
-				clearTx(A, id, rec)
-				return
-			elseif where == "review" then
-				state[id] = "review"
-				report(
-					A,
-					`Anchor tx {id} to {peer[1]}/{peer[2]} (created {tostring(rec.t)}) NEEDS MANUAL REVIEW: B has no record `
-						.. `of applying it, but B may have applied and since forgotten it, so it was NOT resent `
-						.. `(a resend could duplicate items). Inspect with store:PendingTrades(profile).`
-				)
-				return
-			elseif where == "unknown" then
-				break
-			elseif where == "missing" then
-				if not sendTx(peer, id, patch) then
-					break
-				end
-			end
-			-- "queued" or just sent: wait for B to apply and save, then look again.
-			local until_time = os.clock() + wait_time
-			while os.clock() < until_time do
-				if not A:IsActive() then
-					state[id] = "durable" -- the record stays in A's save; next load resumes
-					return
-				end
-				task.wait(1)
-			end
-			wait_time = math.min(RECHECK_MAX, wait_time * 2)
-		end
-		if state[id] == "delivering" then
-			state[id] = "durable" -- retried after A's next save or load
-		end
-	end
-
-	-- A write containing Tx[id] landed (or it was loaded from the DataStore): deliver it,
-	-- unless a delivery is already running. A failed delivery is retried on the next call.
-	local function markDurable(A, id)
-		local tx = A.anchor_meta.Tx
-		if type(tx) ~= "table" or tx[id] == nil then
-			return
-		end
-		local state = txState(A)
-		if state[id] ~= "delivering" and state[id] ~= "review" then
-			state[id] = "durable"
-			task.spawn(deliver, A, id)
-		end
-	end
-
-	Core.AddHook("AfterSave", function(profile, wrote, raw)
-		if wrote ~= true or type(raw) ~= "table" or type(raw.MetaData) ~= "table" then
-			return
-		end
-		local stored = raw.MetaData.Anchor
-		local stored_tx = type(stored) == "table" and stored.Tx or nil
-		local tx = profile.anchor_meta.Tx
-		if type(stored_tx) ~= "table" or type(tx) ~= "table" then
-			return
-		end
-		for id in next, stored_tx do
-			markDurable(profile, id)
-		end
-	end)
-
-	Core.AddHook("Loaded", function(profile)
-		local tx = profile.anchor_meta.Tx
-		if type(tx) == "table" then
-			for id in next, tx do
-				markDurable(profile, id) -- loaded from the DataStore: durable
-			end
-		end
 	end)
 
 	----- Locks -----
@@ -402,6 +306,30 @@ function Trade.install(Anchor, Core)
 
 	----- Anchor.Trade -----
 
+	local function escrowSize(P, base, draft, record): number
+		return math.max(Patch.size(base), Patch.size(draft))
+			+ Patch.size(P.anchor_meta)
+			+ Patch.size(record)
+			+ Patch.size(P.global_updates)
+			+ Patch.size(P.RobloxMetaData)
+			+ 2000
+	end
+
+	local function saveEscrow(P): boolean
+		for attempt = 1, ESCROW_SAVE_ATTEMPTS do
+			if not P:IsActive() then
+				return false
+			end
+			if P:SaveAsync() == true then
+				return true
+			end
+			if attempt < ESCROW_SAVE_ATTEMPTS then
+				task.wait(1)
+			end
+		end
+		return false
+	end
+
 	local commit
 
 	function Anchor.Trade(A, B, fn, opts)
@@ -422,19 +350,17 @@ function Trade.install(Anchor, Core)
 		if not acquire(A, B, timeout) then
 			return false, "Busy"
 		end
-		local results = table.pack(pcall(commit, A, B, fn, opts, timeout))
+		local results = table.pack(pcall(commit, A, B, fn, opts))
 		setLock(A, false)
 		setLock(B, false)
 		if results[1] == false then
-			-- Internal error (e.g. a profile's Data was replaced with a non-table). If A's
-			-- intent was already recorded it still completes on A's next save.
 			report(A, `Trade errored: {tostring(results[2])}`)
 			return false, "Error", tostring(results[2])
 		end
 		return table.unpack(results, 2, results.n)
 	end
 
-	commit = function(A, B, fn, opts, timeout)
+	commit = function(A, B, fn, opts)
 		if not A:IsActive() or not B:IsActive() then
 			return false, "Inactive"
 		end
@@ -443,7 +369,7 @@ function Trade.install(Anchor, Core)
 		local liveA = type(live) == "table" and live[1] or liveFor(A)
 		local liveB = type(live) == "table" and live[2] or liveFor(B)
 
-		-- 1. drafts
+		-- 1. drafts (fn may yield; the diff is against the copies taken before it ran)
 		local baseA, baseB = Patch.deepCopy(A.Data), Patch.deepCopy(B.Data)
 		local draftA, draftB = Patch.deepCopy(baseA), Patch.deepCopy(baseB)
 		local ok_fn, result = pcall(fn, draftA, draftB)
@@ -457,7 +383,6 @@ function Trade.install(Anchor, Core)
 			return false, "Inactive"
 		end
 
-		-- 2. patches
 		local PA, PB = Patch.diff(baseA, draftA), Patch.diff(baseB, draftB)
 		for _, p in { PA, PB } do
 			local ok_patch, problem = Patch.check(p)
@@ -472,75 +397,106 @@ function Trade.install(Anchor, Core)
 			-- Only one side changes: a plain single-profile edit, atomic in its next save.
 			local P = if #PA > 0 then A else B
 			Patch.apply(P.Data, if #PA > 0 then PA else PB, if #PA > 0 then liveA else liveB, reporter(P))
-			P:MarkMetaDirty() -- never skipped as "clean" (IsDirty hooks can't see plain writes)
+			P:MarkMetaDirty()
 			return true
 		end
 
-		-- 3. durable intent on A (same tick as the in-memory change)
+		local outA, inA = Patch.split(PA)
+		local outB, inB = Patch.split(PB)
 		local id = newId()
-		local inverseA = Patch.apply(A.Data, PA, liveA, reporter(A))
-		local tx = A.anchor_meta.Tx
-		if type(tx) ~= "table" then
-			tx = {}
-			A.anchor_meta.Tx = tx
+		local mock = A.is_mock == true or B.is_mock == true
+		local function record(role, P, peer, refund, incoming)
+			return {
+				role = role,
+				refund = refund,
+				incoming = incoming,
+				peer = { peer.ProfileStore.Name, peer.Key },
+				t = os.time(),
+				mock = if mock then true else nil,
+			}
 		end
-		local rec = {
-			peer = { B.ProfileStore.Name, B.Key, if B.is_mock == true then true else nil },
-			patch = PB,
-			t = os.time(),
-		}
-		tx[id] = rec
+
+		-- size guard before anything changes (refund is about the size of outgoing)
+		local probeA = record("A", A, B, outA, inA)
+		local probeB = record("B", B, A, outB, inB)
+		if escrowSize(A, baseA, draftA, probeA) > SIZE_LIMIT or escrowSize(B, baseB, draftB, probeB) > SIZE_LIMIT then
+			return false, "TooBig"
+		end
+
+		-- the escrow tick: data must still be what fn saw (fn may have yielded)
+		if not Patch.deepEqual(A.Data, baseA) or not Patch.deepEqual(B.Data, baseB) then
+			-- Something wrote to A or B while fn ran; diffing would be against stale data.
+			return false, "Error", "profile data changed while the trade function ran; retry"
+		end
+		local refundA = Patch.apply(A.Data, outA, liveA, reporter(A))
+		local refundB = Patch.apply(B.Data, outB, liveB, reporter(B))
+		local recA = record("A", A, B, refundA, inA)
+		local recB = record("B", B, A, refundB, inB)
+		A.anchor_meta.Tx = A.anchor_meta.Tx or {}
+		B.anchor_meta.Tx = B.anchor_meta.Tx or {}
+		A.anchor_meta.Tx[id] = recA
+		B.anchor_meta.Tx[id] = recB
 		A:MarkMetaDirty()
-		local state = txState(A)
-		state[id] = "pending"
-		if liveB ~= nil then
-			PendingLive[id] = liveB
-		end
+		B:MarkMetaDirty()
+		txState(A)[id] = "resolving" -- this thread resolves it; load recovery must not
+		txState(B)[id] = "resolving"
 
-		for attempt = 1, INTENT_SAVE_ATTEMPTS do
-			if state[id] ~= "pending" or not A:IsActive() then
-				break
-			end
-			if A:SaveAsync() == true then
-				markDurable(A, id) -- a write with the current state (and Tx[id]) landed
-				break
-			end
-			if state[id] ~= "pending" or not A:IsActive() then
-				break
-			end
-			if attempt < INTENT_SAVE_ATTEMPTS then
-				task.wait(attempt)
-			end
-		end
-
-		if state[id] ~= "pending" then
-			return true
-		end
-
-		if A:IsActive() then
-			-- Never confirmed while we still own A: undo (same tick, no yield).
-			if tx[id] == rec then
-				tx[id] = nil
-				if next(tx) == nil then
-					A.anchor_meta.Tx = nil
-				end
-			end
-			state[id] = nil
-			PendingLive[id] = nil
-			Patch.apply(A.Data, inverseA, liveA, reporter(A))
-			A:MarkMetaDirty()
-			return false, "SaveFailed"
-		end
-
-		-- A's session ended mid-commit; its release save carries Tx[id].
-		local start = os.clock()
-		while state[id] == "pending" and os.clock() - start < timeout do
+		-- 2. both escrows durable?
+		local okA, okB, doneA, doneB = false, false, false, false
+		task.spawn(function()
+			okA = saveEscrow(A)
+			doneA = true
+		end)
+		task.spawn(function()
+			okB = saveEscrow(B)
+			doneB = true
+		end)
+		while not (doneA and doneB) do
 			task.wait()
 		end
-		if state[id] ~= "pending" then
+		local mine = if okA and okB then "commit" else "abort"
+		local why = if okA and okB then nil
+			elseif A:IsActive() and B:IsActive() then "SaveFailed"
+			else "SessionLost"
+
+		-- 3. the decision
+		local decision = nil
+		local backoff = 1
+		local start = os.clock()
+		while true do
+			decision = decide(recA, id, mine)
+			if decision ~= nil or os.clock() - start >= DECISION_WAIT then
+				break
+			end
+			task.wait(backoff)
+			backoff = math.min(4, backoff * 2)
+		end
+
+		if decision == nil then
+			-- Keep both records (escrowed) and keep trying in the background.
+			report(A, `Anchor trade {id}: decision key unreachable; items stay in escrow until it resolves`)
+			txState(A)[id] = nil
+			txState(B)[id] = nil
+			task.spawn(resolveLoop, A, id, mine, liveA)
+			task.spawn(resolveLoop, B, id, mine, liveB)
+			return false, "Pending"
+		end
+
+		-- 4. apply on each side still loaded here (others resolve on their next load)
+		for _, side in { { A, liveA }, { B, liveB } } do
+			local P = side[1]
+			txState(P)[id] = nil
+			if P:IsActive() then
+				if applyDecision(P, id, decision, side[2]) then
+					task.spawn(P.SaveAsync, P)
+				end
+			end
+		end
+
+		if decision == "commit" then
 			return true
 		end
-		return false, "SessionLost"
+		return false, why or "Aborted"
 	end
 
 	----- store:Gift -----
@@ -554,16 +510,14 @@ function Trade.install(Anchor, Core)
 		error("[Anchor]: Gift target must be a UserId or a profile key")
 	end
 
-	-- store:Gift(userIdOrKey, fn(data) | patch, { Id = string? }) -> (boolean, reason?)
-	-- Delivered through the profile's message queue: applied exactly once by whichever
-	-- server owns the profile (now or at its next load). fn runs on a copy of the latest
-	-- data and its changes are sent as a patch (numbers as increments, so progress made in
-	-- the meantime is kept). Id makes it idempotent: the same Id is applied at most once.
-	function Anchor:Gift(target, gift, opts)
+	-- store:Gift(userIdOrKey, fn(data) | patch) -> (boolean, reason?)
+	-- Queued on the profile and applied exactly once by whichever server owns it (now or at
+	-- its next load). fn runs on a copy of the latest data; its changes travel as a patch
+	-- (numbers as increments, so progress made in the meantime is kept).
+	function Anchor:Gift(target, gift)
 		if type(self) ~= "table" or self.template == nil then
 			error("[Anchor]: Gift must be called on a store (Data:Gift(userId, fn))")
 		end
-		opts = opts or {}
 		local key = keyFor(self, target)
 		local patch
 		if type(gift) == "function" then
@@ -597,8 +551,7 @@ function Trade.install(Anchor, Core)
 		if #patch == 0 then
 			return true
 		end
-		local id = if type(opts.Id) == "string" then opts.Id else newId()
-		if self:MessageAsync(key, { AnchorTx = id, Patch = patch }) ~= true then
+		if self:MessageAsync(key, { AnchorTx = newId(), Patch = patch }) ~= true then
 			return false, "Failed"
 		end
 		return true
@@ -606,15 +559,13 @@ function Trade.install(Anchor, Core)
 
 	----- Trading flag, Update waiting, pending records -----
 
-	-- profile:IsTrading() -> true while a trade involving this profile is committing
-	-- (from the moment fn runs until Anchor.Trade returns; typically one save, ~1 s).
+	-- profile:IsTrading() -> true while a trade involving this profile is committing.
 	Core.Profile.IsTrading = function(self)
 		return locked(self)
 	end
 
-	-- Data:Update waits for a running trade on the player's profile to finish, so its
-	-- write lands on the post-trade data. (Direct writes to profile.Data during that
-	-- window are not held back and can still race with the trade.)
+	-- Data:Update waits for a running trade on the player's profile to finish, so its write
+	-- lands on the post-trade data. (Direct writes to profile.Data are not held back.)
 	local BaseUpdate = Anchor.Update
 	if BaseUpdate ~= nil then
 		function Anchor:Update(player, fn)
@@ -629,10 +580,9 @@ function Trade.install(Anchor, Core)
 		end
 	end
 
-	-- store:PendingTrades(profile) -> { {Id, Store, Key, Patch, Created, Status}, ... }
-	-- Trade records this profile (as side A) still holds. Status: "NeedsReview" (not
-	-- resent because a resend could duplicate; decide by hand), "Delivering", "Waiting"
-	-- (retried on the next save or load), "Committing".
+	-- store:PendingTrades(profile) -> { {Id, Role, Store, Key, Refund, Incoming, Created, Status}, ... }
+	-- Unresolved trade records (items in escrow). Status: "NeedsReview" (resolution would
+	-- overwrite changed data; decide by hand), "Resolving", "Waiting" (resolves on next load).
 	function Anchor:PendingTrades(profile)
 		local out = {}
 		local tx = type(profile) == "table" and type(profile.anchor_meta) == "table" and profile.anchor_meta.Tx
@@ -640,16 +590,19 @@ function Trade.install(Anchor, Core)
 			return out
 		end
 		local state = txState(profile)
-		local status_names = { review = "NeedsReview", delivering = "Delivering", durable = "Waiting", pending = "Committing" }
+		local names = { review = "NeedsReview", resolving = "Resolving" }
 		for id, rec in next, tx do
-			local peer = type(rec) == "table" and rec.peer or {}
+			rec = if type(rec) == "table" then rec else {}
+			local peer = type(rec.peer) == "table" and rec.peer or {}
 			table.insert(out, {
 				Id = id,
+				Role = rec.role,
 				Store = peer[1],
 				Key = peer[2],
-				Patch = Patch.deepCopy(type(rec) == "table" and rec.patch or nil),
-				Created = type(rec) == "table" and rec.t or nil,
-				Status = status_names[state[id]] or "Waiting",
+				Refund = Patch.deepCopy(rec.refund),
+				Incoming = Patch.deepCopy(rec.incoming),
+				Created = rec.t,
+				Status = names[state[id]] or "Waiting",
 			})
 		end
 		table.sort(out, function(a, b)
@@ -660,8 +613,9 @@ function Trade.install(Anchor, Core)
 
 	Anchor.Patch = Patch
 	Anchor._Trade = {
-		deliver = deliver,
-		applyOnce = applyOnce,
+		decide = decide,
+		resolve = resolveLoop,
+		DECISION_STORE = DECISION_STORE,
 	}
 end
 

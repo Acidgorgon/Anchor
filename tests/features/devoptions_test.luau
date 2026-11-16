@@ -191,3 +191,52 @@ T.test("KeyPrefix sets Bind's key, Send and Gift targets", function()
 	end), true)
 	T.expect(Sim.peek("Main", "PLAYER_5") ~= nil)
 end)
+
+T.test("PlayAs and View build the target's key with Bind's custom Key function", function()
+	local function key(player)
+		return "u:" .. player.UserId
+	end
+	seed("u:2", { Coins = 42, Items = {} }, { 2 })
+	local s = studio()
+	local Data = anchor(s).new("Main", TEMPLATE, { PlayAs = 2 })
+	Data:Bind({ Key = key })
+	local player, profile = join(s, Data, 1)
+	T.eq(profile.Key, "u:2")
+	T.eq(profile.Data.Coins, 42)
+	local _, other = join(s, Data, 3)
+	T.eq(other.Key, "u:3")
+	s:removePlayer(player)
+	Sim.advance(3)
+	T.eq(Sim.peek("Main", "Player_2"), nil, "KeyPrefix key never touched")
+
+	local s2 = studio()
+	local Viewer = anchor(s2).new("Main", TEMPLATE, { View = 2 })
+	Viewer:Bind({ Key = key })
+	local _, view = join(s2, Viewer, 5)
+	T.eq(view.Key, "u:2")
+	T.eq(view.Data.Coins, 42)
+end)
+
+T.test("PlayAs with a Key function that can't build the target's key kicks instead of using another key", function()
+	local s = studio()
+	local A = anchor(s)
+	local errors = {}
+	A.OnError:Connect(function(message)
+		table.insert(errors, message)
+	end)
+	local Data = A.new("Main", TEMPLATE, { PlayAs = 2 })
+	Data:Bind({
+		Key = function(player)
+			if player.UserId == 2 then
+				error("no key for 2")
+			end
+			return "u:" .. player.UserId
+		end,
+	})
+	s:addPlayer(1)
+	Sim.advance(3)
+	T.eq((s:wasKicked(1)), true)
+	T.expect(#errors == 1 and string.find(errors[1], "no key for 2", 1, true), T.show(errors))
+	T.eq(Sim.peek("Main", "Player_2"), nil)
+	T.eq(Sim.peek("Main", "u:1"), nil)
+end)
