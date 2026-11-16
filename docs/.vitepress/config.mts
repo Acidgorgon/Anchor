@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress'
 import { family } from './theme/family'
 
 // Shared look and family links (theme/family.ts is identical on the Current, Ripple and Anchor sites)
-const shared = family('anchor', '/Anchor/')
+const shared = family('anchor', '/Anchor/', { license: 'Apache-2.0' })
 
 const guideSidebar = [
   {
