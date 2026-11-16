@@ -18,7 +18,8 @@ reverse order loses the item instead of duplicating it.
 `Anchor.Trade` is a two-phase escrow with a single commit point:
 
 1. **Escrow.** Your function runs on **copies** of both players' data. Anchor splits each side's changes
-   into what **leaves** (removed items, coins going down) and what **arrives**. In one frame it takes the
+   into what **leaves** (removed items, coins going down, and any existing value that gets replaced, such
+   as the sword in a slot that receives a gem) and what **arrives**. In one frame it takes the
    leaving part out of both players' data and writes an escrow record into both saves: what to refund,
    and what to deliver. From this moment the traded items can't be spent twice.
 2. **Save both.** Anchor saves Alice and Bob at the same time. If both escrow saves land it proposes
@@ -104,7 +105,9 @@ so route gameplay writes through `Data:Update` (or check `IsTrading()`).
 ### Trades that need a human
 
 Applying a side is never forced onto data it no longer fits. If, say, an `Inc` would land on a field that
-is no longer a number (because you migrated your data shape in between), Anchor keeps the escrow record,
+is no longer a number (because you migrated your data shape in between), or a delivered or refunded value
+would replace a *different* value the player got in the meantime (a refunded Level 9 sword landing on the
+Level 1 sword they just found; an equal value counts as already applied), Anchor keeps the escrow record,
 leaves the items in escrow, fires `Anchor.OnError` with `NEEDS MANUAL REVIEW`, and lists it in
 `Data:PendingTrades(profile)`:
 
@@ -118,7 +121,9 @@ end
 
 `Data:Gift` changes a player's data whether they're on this server, another server, or offline. It rides
 the save's message queue and is applied exactly once by whichever server owns the profile, now or at their
-next join: the change and the removal of the message land in the same save.
+next join: the change and the removal of the message land in the same save. Each gift carries an internal
+id, and the player's save remembers the last 1000 applied gift ids, so a gift delivered again (for example
+after a server crash) is skipped rather than applied twice.
 
 ```lua
 Data:Gift(userId, function(data)
@@ -168,7 +173,9 @@ end
 
 - The grant runs on a copy. Its changes and the `PurchaseId` are applied together, then the profile is
   saved. If that save fails, Roblox retries later and the grant is **not** applied again.
-- The ledger keeps every `PurchaseId` whose save isn't confirmed yet, plus the newest 100 confirmed ones.
+- A `PurchaseId` counts as confirmed only once `PurchaseGranted` was actually returned for it (a flag kept
+  in the save). The ledger keeps every unconfirmed `PurchaseId`, however old, plus the newest 100
+  confirmed ones, so a receipt Roblox may still retry is never forgotten.
 - A grant that errors or returns `false` changes nothing and returns `NotProcessedYet`.
 - The player must be in this server with their data loaded, otherwise `NotProcessedYet` (Roblox
   delivers it again when they join).

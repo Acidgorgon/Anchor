@@ -311,7 +311,8 @@ Store:Gift(
 ```
 
 Changes a player's data wherever they are: on this server, another server, or offline (applied at their
-next join). Each call is one gift, applied exactly once through the save's message queue. Reasons:
+next join). Each call is one gift, applied exactly once through the save's message queue (the save
+remembers the last 1000 applied gift ids, so a redelivered gift is skipped). Reasons:
 `"Cancelled"`, `"Error"`, `"Invalid"`, `"Failed"` (the message couldn't be stored).
 
 ```lua
@@ -323,7 +324,7 @@ Data:Gift(userId, function(data) data.Coins += 500 end)
 | Op | Effect |
 |---|---|
 | `{ "Inc", path, delta }` | `t[k] = (t[k] or 0) + delta` |
-| `{ "Set", path, value }` | `t[k] = value` (a copy) |
+| `{ "Set", path, value }` | `t[k] = value` (a copy). In a trade, replacing an existing value escrows the old one; a delivery or refund never replaces a different value (kept for review instead) |
 | `{ "Remove", path }` | `t[k] = nil` |
 | `{ "Push", path, value }` | append `value` to an array |
 | `{ "Pull", path, value }` | remove the first array item equal to `value` |
@@ -363,7 +364,8 @@ Store:ProcessReceipt(
 
 Grants a developer product exactly once. Returns `PurchaseGranted` only after a save containing the grant
 and its `PurchaseId` landed; otherwise `NotProcessedYet`. `grant` runs on a copy; return `false` (or error)
-to refuse. The player must be loaded on this server.
+to refuse. The player must be loaded on this server. A `PurchaseId` may be dropped from the dedup ledger
+only after `PurchaseGranted` was returned for it, and only beyond the newest 100 such ids.
 
 ```lua
 MarketplaceService.ProcessReceipt = function(info)
