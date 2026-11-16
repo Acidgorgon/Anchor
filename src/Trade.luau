@@ -40,13 +40,26 @@
 		   - Not saved and A still active: undo PA and the Tx record -> "SaveFailed".
 		   - A's session ended: wait for its release save (it carries the Tx) -> true when it
 		     lands, else "SessionLost".
-		4. Once a write of A containing Tx[id] has landed (AfterSave hook): deliver PB.
-		   B active here: apply PB to live B + B.MetaData.Anchor.Applied[id] in the same tick,
-		   force-save B. Otherwise (or if that save fails): MessageAsync B's key with
-		   {AnchorTx = id, Patch = PB}; whichever server owns B applies it once (Applied dedup).
-		5. When B's save (or the message) is confirmed: drop A's Tx[id] and save A.
-		6. Recovery: a profile that loads with Tx records re-delivers them (B dedups).
-		   Applied entries are pruned after 30 days, max 500.
+		4. Once a write of A containing Tx[id] (with its creation time t) has landed
+		   (AfterSave hook): deliver PB. B active here: apply PB to live B +
+		   B.MetaData.Anchor.Applied[id] in the same tick, force-save B. Otherwise read B's
+		   key (GetAsync, read-only) and send {AnchorTx = id, Patch = PB} to B's queue only if
+		   B hasn't applied it and it isn't already queued; whichever server owns B applies
+		   it once (Applied dedup).
+		5. A drops Tx[id] only when B HAS APPLIED it: B's save with Applied[id] landed on
+		   this server, or a read of B's key shows Applied[id]. While waiting, A re-reads B's
+		   key (10 s, doubling to 5 min) and resends if the message vanished (e.g. B's queue
+		   overflowed its 1000-message cap).
+		6. Recovery: a profile that loads with Tx records resumes step 4-5 (read first).
+		   B forgets Applied ids after 90 days / beyond 2000 entries and keeps the newest
+		   forgotten time in Applied floor (MetaData.Anchor.AppliedFloor). A record that is
+		   neither applied nor queued but older than that window (or than B's floor) is NOT
+		   resent: a resend could duplicate. It is kept, OnError fires ("NEEDS MANUAL
+		   REVIEW"), and store:PendingTrades(profile) lists it.
+
+	While a trade commits, profile:IsTrading() is true and Data:Update(player, fn) waits
+	for it to finish. Direct writes to profile.Data in that window (~1 save) can still race:
+	route writes through Data:Update, or check IsTrading().
 
 	Live proxies: opts.Live = {liveA, liveB} (Ripple states wrapping profile.Data in place),
 	or the states from store:UseRipple(). Patches are applied through them; a write the proxy
@@ -55,8 +68,11 @@
 
 local TX_LOCK_TIMEOUT = 30
 local INTENT_SAVE_ATTEMPTS = 3
-local APPLIED_MAX_AGE = 30 * 24 * 60 * 60
-local APPLIED_MAX_COUNT = 500
+local APPLIED_MAX_AGE = 90 * 24 * 60 * 60 -- B forgets applied tx ids after this...
+local APPLIED_MAX_COUNT = 2000 -- ...or beyond this many (oldest first)
+local CLOCK_MARGIN = 60 * 60 -- server clocks may disagree; ambiguity is judged with this slack
+local RECHECK_FIRST = 10 -- (Seconds) first re-read of B's key while waiting for B to apply
+local RECHECK_MAX = 300
 
 local Trade = {}
 
@@ -112,12 +128,20 @@ function Trade.install(Anchor, Core)
 
 	----- B side: apply a patch once -----
 
-	local function pruneApplied(applied)
+	-- Forgets old Applied entries. meta.AppliedFloor = the newest applied-time ever
+	-- forgotten: a tx created before it may have been applied and forgotten, so a redo of
+	-- such a tx is ambiguous (see checkPeer).
+	local function pruneApplied(meta, applied)
 		local now = os.time()
+		local floor = if type(meta.AppliedFloor) == "number" then meta.AppliedFloor else 0
 		local entries = {}
 		for id, t in next, applied do
-			if type(t) ~= "number" or now - t > APPLIED_MAX_AGE then
+			if type(t) ~= "number" then
 				applied[id] = nil
+				floor = math.max(floor, now)
+			elseif now - t > APPLIED_MAX_AGE then
+				applied[id] = nil
+				floor = math.max(floor, t)
 			else
 				table.insert(entries, { id, t })
 			end
@@ -128,7 +152,11 @@ function Trade.install(Anchor, Core)
 			end)
 			for i = 1, #entries - APPLIED_MAX_COUNT do
 				applied[entries[i][1]] = nil
+				floor = math.max(floor, entries[i][2])
 			end
+		end
+		if floor > 0 then
+			meta.AppliedFloor = floor
 		end
 	end
 
@@ -153,7 +181,7 @@ function Trade.install(Anchor, Core)
 			report(profile, `Anchor tx {id}: {missed} array item(s) to remove were no longer there`)
 		end
 		applied[id] = os.time()
-		pruneApplied(applied)
+		pruneApplied(meta, applied)
 		profile:MarkMetaDirty()
 		return true
 	end
@@ -198,36 +226,111 @@ function Trade.install(Anchor, Core)
 		return ok == true and accepted == true
 	end
 
+	-- Reads B's key (read-only) and says where tx `id` stands:
+	--   "applied"  B's saved state has Applied[id]               -> A may forget the record
+	--   "queued"   the message is still in B's saved queue        -> wait
+	--   "missing"  neither, and B can't have applied+forgotten it -> (re)send
+	--   "review"   neither, but B may have applied it and since forgotten it (pruned): a
+	--              resend could apply it twice -> keep the record, a human decides
+	--   "unknown"  the read failed (server closing, unreadable key) -> retry later
+	local function checkPeer(peer, id, rec): string
+		local store = storeFor(peer)
+		local ok, view = pcall(function()
+			if peer[3] == true then
+				return store.Mock:GetAsync(peer[2])
+			end
+			return store:GetAsync(peer[2])
+		end)
+		if ok ~= true or Anchor.IsClosing == true then
+			return "unknown"
+		end
+		if view == nil then
+			-- B's key holds no profile (it was loaded for the trade, so this is not normal).
+			return "review"
+		end
+		local meta = view.anchor_meta or {}
+		if type(meta.Applied) == "table" and meta.Applied[id] ~= nil then
+			return "applied"
+		end
+		for _, update in ipairs(view.global_updates or {}) do
+			local data = update[#update]
+			if type(data) == "table" and data.AnchorTx == id then
+				return "queued"
+			end
+		end
+		local created = if type(rec.t) == "number" then rec.t else 0
+		local floor = if type(meta.AppliedFloor) == "number" then meta.AppliedFloor else 0
+		if os.time() - created > APPLIED_MAX_AGE - CLOCK_MARGIN or floor >= created - CLOCK_MARGIN then
+			return "review"
+		end
+		return "missing"
+	end
+
+	-- Delivers A's durable intent `id` and keeps A's record until B has applied it: B's
+	-- save with Applied[id] landed on this server, or a read of B's key shows Applied[id].
 	deliver = function(A, id)
 		local tx = A.anchor_meta.Tx
 		local rec = type(tx) == "table" and tx[id] or nil
 		local state = txState(A)
-		if rec == nil or state[id] == "delivering" then
+		if rec == nil or state[id] == "delivering" or state[id] == "review" then
 			return
 		end
 		state[id] = "delivering"
 
 		local peer, patch = rec.peer, rec.patch
-		local confirmed = false
-		local ok_shape = type(peer) == "table" and type(peer[1]) == "string" and type(peer[2]) == "string"
-		if ok_shape then
+		if type(peer) ~= "table" or type(peer[1]) ~= "string" or type(peer[2]) ~= "string" then
+			state[id] = "review"
+			report(A, `Anchor tx {id} has an invalid peer; kept for manual review (store:PendingTrades(profile))`)
+			return
+		end
+
+		local wait_time = RECHECK_FIRST
+		while true do
+			if type(A.anchor_meta.Tx) ~= "table" or A.anchor_meta.Tx[id] ~= rec then
+				state[id] = nil
+				return
+			end
+			-- B loaded here: apply directly, confirmed by B's own save.
 			local B = Core.GetActiveProfile({ Name = peer[1] }, peer[2], peer[3] == true)
 			if B ~= nil and B:IsActive() and B.view_mode ~= true then
 				applyOnce(B, id, patch, PendingLive[id])
-				confirmed = B:SaveAsync()
+				if B:SaveAsync() == true then
+					clearTx(A, id, rec)
+					return
+				end
 			end
-			if not confirmed then
-				-- Always safe: B applies a tx id at most once.
-				confirmed = sendTx(peer, id, patch)
+			local where = checkPeer(peer, id, rec)
+			if where == "applied" then
+				clearTx(A, id, rec)
+				return
+			elseif where == "review" then
+				state[id] = "review"
+				report(
+					A,
+					`Anchor tx {id} to {peer[1]}/{peer[2]} (created {tostring(rec.t)}) NEEDS MANUAL REVIEW: B has no record `
+						.. `of applying it, but B may have applied and since forgotten it, so it was NOT resent `
+						.. `(a resend could duplicate items). Inspect with store:PendingTrades(profile).`
+				)
+				return
+			elseif where == "unknown" then
+				break
+			elseif where == "missing" then
+				if not sendTx(peer, id, patch) then
+					break
+				end
 			end
-		else
-			report(A, `Anchor tx {id} has an invalid peer; dropped`)
-			confirmed = true
+			-- "queued" or just sent: wait for B to apply and save, then look again.
+			local until_time = os.clock() + wait_time
+			while os.clock() < until_time do
+				if not A:IsActive() then
+					state[id] = "durable" -- the record stays in A's save; next load resumes
+					return
+				end
+				task.wait(1)
+			end
+			wait_time = math.min(RECHECK_MAX, wait_time * 2)
 		end
-
-		if confirmed then
-			clearTx(A, id, rec)
-		elseif state[id] == "delivering" then
+		if state[id] == "delivering" then
 			state[id] = "durable" -- retried after A's next save or load
 		end
 	end
@@ -240,7 +343,7 @@ function Trade.install(Anchor, Core)
 			return
 		end
 		local state = txState(A)
-		if state[id] ~= "delivering" then
+		if state[id] ~= "delivering" and state[id] ~= "review" then
 			state[id] = "durable"
 			task.spawn(deliver, A, id)
 		end
@@ -499,6 +602,60 @@ function Trade.install(Anchor, Core)
 			return false, "Failed"
 		end
 		return true
+	end
+
+	----- Trading flag, Update waiting, pending records -----
+
+	-- profile:IsTrading() -> true while a trade involving this profile is committing
+	-- (from the moment fn runs until Anchor.Trade returns; typically one save, ~1 s).
+	Core.Profile.IsTrading = function(self)
+		return locked(self)
+	end
+
+	-- Data:Update waits for a running trade on the player's profile to finish, so its
+	-- write lands on the post-trade data. (Direct writes to profile.Data during that
+	-- window are not held back and can still race with the trade.)
+	local BaseUpdate = Anchor.Update
+	if BaseUpdate ~= nil then
+		function Anchor:Update(player, fn)
+			local Get = self.Get
+			if self.bind_state ~= nil and Get ~= nil then
+				local profile = Get(self, player)
+				while profile ~= nil and locked(profile) and profile:IsActive() do
+					task.wait()
+				end
+			end
+			return BaseUpdate(self, player, fn)
+		end
+	end
+
+	-- store:PendingTrades(profile) -> { {Id, Store, Key, Patch, Created, Status}, ... }
+	-- Trade records this profile (as side A) still holds. Status: "NeedsReview" (not
+	-- resent because a resend could duplicate; decide by hand), "Delivering", "Waiting"
+	-- (retried on the next save or load), "Committing".
+	function Anchor:PendingTrades(profile)
+		local out = {}
+		local tx = type(profile) == "table" and type(profile.anchor_meta) == "table" and profile.anchor_meta.Tx
+		if type(tx) ~= "table" then
+			return out
+		end
+		local state = txState(profile)
+		local status_names = { review = "NeedsReview", delivering = "Delivering", durable = "Waiting", pending = "Committing" }
+		for id, rec in next, tx do
+			local peer = type(rec) == "table" and rec.peer or {}
+			table.insert(out, {
+				Id = id,
+				Store = peer[1],
+				Key = peer[2],
+				Patch = Patch.deepCopy(type(rec) == "table" and rec.patch or nil),
+				Created = type(rec) == "table" and rec.t or nil,
+				Status = status_names[state[id]] or "Waiting",
+			})
+		end
+		table.sort(out, function(a, b)
+			return (a.Created or 0) < (b.Created or 0)
+		end)
+		return out
 	end
 
 	Anchor.Patch = Patch

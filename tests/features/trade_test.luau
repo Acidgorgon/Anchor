@@ -227,7 +227,7 @@ T.test("B leaves mid-trade: PB goes through B's message queue and is applied on 
 	local rb = Sim.peek("Main", "B")
 	T.eq(rb.Data.Coins, 50, "B released before the patch arrived")
 	T.eq(#rb.GlobalUpdates[2], 1, "patch waits in B's queue")
-	T.eq(Sim.peek("Main", "A").MetaData.Anchor, nil, "accepted message clears A's record")
+	T.expect(A.anchor_meta.Tx ~= nil, "A keeps its record until B has applied it")
 	-- B joins another server: applied at load, exactly once
 	local s2 = Sim.newServer({ JobId = "S2" })
 	local st2 = anchor(s2).New("Main", TEMPLATE)
@@ -236,6 +236,11 @@ T.test("B leaves mid-trade: PB goes through B's message queue and is applied on 
 	T.deepEq(B2.Data.Items, { Sword = { Level = 3 } })
 	B2:EndSession()
 	Sim.advance(5)
+	T.expect(Sim.runUntil(function()
+		return A.anchor_meta.Tx == nil
+	end, 400), "A re-read B's key, saw Applied, dropped the record")
+	Sim.advance(5)
+	T.eq(Sim.peek("Main", "A").MetaData.Anchor, nil)
 	local B3 = load(s2, st2, "B")
 	T.eq(B3.Data.Coins, 150, "not applied twice")
 	T.eq(#Sim.peek("Main", "B").GlobalUpdates[2], 0)
@@ -284,7 +289,10 @@ T.test("redo onto newer B data keeps B's progress (increments, per-key sets)", f
 	T.deepEq(B2.Data.Items, { Shield = true, Sword = { Level = 3 } })
 	T.deepEq(B2.Data.Bag, { "pear", "melon" })
 	Sim.advance(20)
-	T.eq(A3.anchor_meta.Tx, nil, "A's record cleared once the message was accepted")
+	T.expect(A3.anchor_meta.Tx ~= nil, "applied in B's memory only: A keeps its record")
+	T.expect(Sim.runUntil(function()
+		return A3.anchor_meta.Tx == nil
+	end, 700), "cleared after B's save with Applied landed and A re-read it")
 end)
 
 T.test("live proxies: writes go through the proxy; a rejected field falls back to the plain table", function()
