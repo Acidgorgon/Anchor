@@ -20,6 +20,10 @@
 	              on the string, so a stock server can never claim (and later overwrite) a
 	              Compact profile.
 
+	Readers: any Data holding an AnchorBlob buffer is Compact (keys beside it, e.g. from a
+	stock view-mode overwrite, are ignored and reported); a poisoned counter without a
+	blob is refused, never read as plain data.
+
 	INVARIANT: a blob in Data <=> the counter is poisoned. Both are written together
 	in the same transform (writeData), so no stored version ever has one without the other.
 
@@ -112,32 +116,58 @@ end
 
 ----- Data -----
 
+-- Any Data holding an AnchorBlob buffer is Compact, whatever sits beside it: a stock
+-- view-mode overwrite (GetAsync + Reconcile/edit + SetAsync) adds template keys next to
+-- the blob, and the blob is still the player's data.
 function Envelope.isCompactData(data: any): boolean
-	if type(data) ~= "table" or type(data[Envelope.BLOB_KEY]) ~= "buffer" then
-		return false
+	return type(data) == "table" and type(data[Envelope.BLOB_KEY]) == "buffer"
+end
+
+-- Keys stored beside the blob in a Compact Data table (sorted), or nil when there are none.
+function Envelope.strayKeys(data: any): { string }?
+	if type(data) ~= "table" then
+		return nil
 	end
-	local first = next(data)
-	return next(data, first) == nil -- exactly one key
+	local keys = nil
+	for key in next, data do
+		if key ~= Envelope.BLOB_KEY then
+			keys = keys or {}
+			table.insert(keys, tostring(key))
+		end
+	end
+	if keys ~= nil then
+		table.sort(keys)
+	end
+	return keys
 end
 
 -- Reads Data out of a stored envelope.
--- Returns ok, data, blob (the stored blob when Compact), err.
--- A Compact blob that fails to decode is an error: the caller must NOT treat the
--- profile as missing (that would overwrite it).
-function Envelope.readData(raw: any): (boolean, any, buffer?, string?)
+-- Returns ok, data, blob (the stored blob when Compact), err, stray (keys stored beside
+-- the blob, which are ignored; the caller reports them).
+-- A Compact blob that fails to decode is an error, and so is a poisoned load counter
+-- (proof the profile is Compact) with no blob: the caller must NOT treat the profile as
+-- missing or as plain data (that would overwrite the player's data).
+function Envelope.readData(raw: any): (boolean, any, buffer?, string?, { string }?)
 	local data = raw.Data
 	if Envelope.isCompactData(data) then
 		local blob = data[Envelope.BLOB_KEY]
 		local ok, result = pcall(Codec.decode, blob)
 		if ok == false then
-			return false, nil, nil, tostring(result)
+			return false, nil, nil, tostring(result), nil
 		end
 		if type(result) ~= "table" then
-			return false, nil, nil, "Compact blob did not decode to a table"
+			return false, nil, nil, "Compact blob did not decode to a table", nil
 		end
-		return true, result, blob, nil
+		return true, result, blob, nil, Envelope.strayKeys(data)
 	end
-	return true, data or {}, nil, nil
+	if Envelope.isPoisoned(raw.MetaData) then
+		return false,
+			nil,
+			nil,
+			`profile is Compact (MetaData.SessionLoadCount = "{Envelope.POISON}") but Data has no {Envelope.BLOB_KEY} buffer`,
+			nil
+	end
+	return true, data or {}, nil, nil, nil
 end
 
 -- Writes Data into latest_data inside the UpdateAsync transform.

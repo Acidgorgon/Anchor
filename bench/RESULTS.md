@@ -19,7 +19,7 @@ This run is after the SPEC section 9 perf pass. "Before" numbers are from the pr
 2. **Compact costs one encode plus one verify per save.** That is about 2.2–2.5 ms native (4.1–4.4 ms interpreted) per FM autosave, against 3.8 ms before. Load is one decode, unchanged. Over the 50-player server it is 772 ms of library CPU, 9.6× stock's Luau CPU, down from 15×. In exchange it writes 14.2 MB instead of 40.7 MB, and Roblox's C++ JSON handles 3× less text per save and load, which this bench can't measure.
 3. **Compat lost its memory advantage, by design.** Compat now keeps `LastSavedData` as a full deep copy, as stock does: 1 040 KB per FM profile, against 554 KB before and 1 038 KB for stock. `LastSavedData = false` skips that copy (and `LastSavedData` stays nil). Compact still keeps a ~29 KB blob and holds 530 KB per FM profile until `LastSavedData` is read.
 4. **Smaller saves (Compact only).** An FM profile is stored as 39.1 KB of JSON instead of 112.1 KB (−65%), about 26 KB if Roblox zstd-compresses the buffer. Compat writes exactly the bytes stock writes.
-5. **The clean-save skip still costs one encode, only where it can trigger.** At default constants a skip can never trigger (see section 5), so Anchor no longer encodes for it. With a short period (here 10 s), a Compat autosave pays one compare encode: about 0.8–0.9 ms native for FM, written or skipped. An `IsDirty` hook removes that encode. The call savings are unchanged: at a 60 s period an idle player costs 10 calls/h instead of stock's 60.
+5. **The clean-save skip still costs one encode, only where it can trigger.** At default constants a skip can never trigger (see section 5), so Anchor no longer encodes for it. With a short period (here 10 s), a Compat autosave pays one compare encode: about 0.8–0.9 ms native for FM, written or skipped. A Compact autosave that is written after that compare pays the compare plus its own encode + verify, about 3–3.5 ms. An `IsDirty` hook removes the compare encode in Compat. The call savings are unchanged: at a 60 s period an idle player costs 10 calls/h instead of stock's 60.
 
 ## 1. Load (`StartSessionAsync`), library Luau CPU and allocations
 
@@ -74,6 +74,8 @@ The "before" column had no no-skip rows. Before the pass every autosave ran the 
 
 Native FM timings vary between runs. A second native run of this section gave 906 µs (Compat dirty), 858 (Compat clean), 2 470 (Compact dirty), 832 (Compact clean), 2 412 and 2 379 (Compact no-skip). The 1 309 and 3 157 µs above are high outliers of that range: the alloc column shows the same work in both runs.
 
+After this run, a review fix moved the Compact snapshot inside the UpdateAsync transform, so that it is taken at the same instant as the bookkeeping (messages, receipts, trades, `ClearDirty`) and a release save picks up writes made later in the same frame. A re-run of the native save section afterwards gave Compact no-skip 2 626 / 2 485 µs (dirty / clean), the same work by the alloc column (878 KB). The skip-capable Compact dirty row is 3 520 µs and 911 KB, because the skip-check blob can no longer be the one written.
+
 What an autosave costs now (FM, native, measured with Codec alone):
 
 | path | Codec work | cost |
@@ -81,7 +83,8 @@ What an autosave costs now (FM, native, measured with Codec alone):
 | Compat, default constants | none | ~0 |
 | Compat, skip possible, no `IsDirty` hook | one Data encode (the compare), written or skipped | ~0.8 ms |
 | Compat, skip possible, `IsDirty` hook | none (hook decides) | ~0 |
-| Compact, any constants | encode + verify (decode + deep-compare); the blob is reused as the skip baseline and as `LastSavedData` | ~2.2 ms |
+| Compact, default constants | encode + verify (decode + deep-compare), taken inside the UpdateAsync transform from the live Data; the blob is reused as the skip baseline and as `LastSavedData` | ~2.2–2.6 ms |
+| Compact, skip possible, written | the compare encode, then the transform's own encode + verify | ~3–3.5 ms |
 | Compact, clean skip | one encode (the compare) | ~0.8 ms |
 | any format, after a failed UpdateAsync | `Codec.validate`, to name the bad path in `OnError` | ~0.7 ms |
 

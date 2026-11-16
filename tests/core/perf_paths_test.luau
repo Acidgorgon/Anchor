@@ -1,6 +1,6 @@
 -- SPEC section 9 cost contract, checked by counting Codec calls: Compat does no Codec
--- work on the happy path; Compact pays one encode + one verify per save and reuses
--- the blob; Codec.validate runs only after a failed write, to name the bad path.
+-- work on the happy path; Compact pays one encode + one verify per transform run and
+-- reuses that blob (skip baseline, LastSavedData); Codec.validate runs only after a failed write, to name the bad path.
 local T = require("@mock/testkit")
 local Sim = require("@mock/sim")
 
@@ -174,7 +174,7 @@ T.test("Compact save: one encode, one decode, one equal; load: one decode, no en
 	T.eq(counts.decode + counts.decodeInto, 2)
 end)
 
-T.test("Compact with a skip-capable period: the skip-check blob is reused for the write", function()
+T.test("Compact with a skip-capable period: one compare encode, then one encode + verify inside the write", function()
 	local s = Sim.newServer()
 	local A, counts, reset, watch = bootCounted(s)
 	A.SetConstant("AUTO_SAVE_PERIOD", 30)
@@ -184,9 +184,10 @@ T.test("Compact with a skip-capable period: the skip-check blob is reused for th
 	T.eq(s:await(p.SaveAsync, p), true) -- baseline blob
 	reset()
 	p.Data.Coins = 5
-	Sim.advance(32) -- dirty autosave: skip check encodes once, write reuses it
+	Sim.advance(32) -- dirty autosave: the skip check encodes once; the write takes its own
+	-- snapshot inside the transform (Data may change while the call is in flight)
 	T.eq(Sim.peek("PlayerData", "Player_1").MetaData.Anchor ~= nil, true)
-	T.eq(counts.dataEncode, 1, T.show(counts))
+	T.eq(counts.dataEncode, 2, T.show(counts))
 	T.eq(counts.decode, 1)
 	T.eq(counts.equal, 1)
 	reset()

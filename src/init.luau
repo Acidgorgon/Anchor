@@ -32,6 +32,8 @@
 		Reset = true                          -- every join starts from the template (old save kept in version history)
 		PlayAs = userId                       -- the first player to join plays on that user's save
 		View = userId                         -- read-only look at that user's save, never saves
+		                                         (PlayAs/View keys come from Bind's Key function, given a
+		                                         stand-in player whose UserId is the target's)
 		NoSave = true                         -- your own save, never written (no session lock either)
 		AllowDevOptionsLive = true            -- (code only) honour dev options on live servers too.
 		                                         Without it they are ignored there with one warning.
@@ -266,6 +268,28 @@ function Anchor:Bind(bind_options: BindOptions?)
 		return player.Parent == Players
 	end
 
+	-- PlayAs / View: the target's key, built by the same Key function as everyone else's.
+	-- The function gets a stand-in whose UserId is the target's (other fields read through
+	-- to the joining player). Returns nil (and reports) if the function can't build it.
+	local function key_for_user(player, user_id)
+		if bind_options.Key == nil then
+			return prefix .. user_id
+		end
+		local stand_in = setmetatable({ UserId = user_id }, {
+			__index = function(_, field)
+				return player[field]
+			end,
+		})
+		local ok, key = pcall(key_fn, stand_in)
+		if ok == true and type(key) == "string" and key ~= "" then
+			return key
+		end
+		local message = `Bind Key function could not build the key for dev option user {user_id}: {tostring(key)}`
+		warn(`[Anchor]: {message} (STORE:{store.Name})`)
+		Anchor.OnError:Fire(message, store.Name, nil)
+		return nil
+	end
+
 	local function load_view(player, key)
 		local profile = store:GetAsync(key)
 		if profile == nil then
@@ -285,11 +309,11 @@ function Anchor:Bind(bind_options: BindOptions?)
 		local read_only = false
 		local own_save = true
 		if dev.View ~= nil then
-			key = prefix .. dev.View
+			key = key_for_user(player, dev.View)
 			read_only = true
 			own_save = false
 		elseif dev.PlayAs ~= nil and state.play_as == nil then
-			key = prefix .. dev.PlayAs
+			key = key_for_user(player, dev.PlayAs)
 			state.play_as = player
 			own_save = false
 		end
@@ -298,7 +322,9 @@ function Anchor:Bind(bind_options: BindOptions?)
 		end
 
 		local profile
-		if read_only then
+		if key == nil then
+			profile = nil -- reported above; kicked below (never falls back to another key)
+		elseif read_only then
 			profile = load_view(player, key)
 		else
 			local started = os.clock()

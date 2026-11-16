@@ -580,6 +580,17 @@ local function SetLastSavedBlob(profile, blob)
 	rawset(profile, "LastSavedData", nil)
 end
 
+-- [Anchor] Keys stored beside a Compact blob (a stock view-mode overwrite adds them):
+-- the blob is the data; the stray keys are ignored and dropped by the next write.
+local function ReportStrayKeys(store_name, profile_key, stray)
+	if stray == nil then
+		return
+	end
+	local message = `Data has keys beside the Compact blob ({table.concat(stray, ", ")}), likely written by a stock ProfileStore overwrite; they were ignored and the blob was loaded`
+	warn(`[{LIB}]: {message} (STORE:{store_name}; KEY:{profile_key})`)
+	OnError:Fire(message, store_name, profile_key)
+end
+
 local function SetLastSavedFromRaw(profile, raw)
 	-- Data written by someone else (we didn't write in this call): read whatever format it is.
 	if Envelope.isCompactData(raw.Data) then
@@ -591,8 +602,9 @@ end
 
 ----- Saving -----
 
--- [Anchor] Clean-save skip decision for autosaves. Returns skip, blob: when Data had to be
--- encoded to decide, the blob is returned so a Compact write can reuse it.
+-- [Anchor] Clean-save skip decision for autosaves. Returns skip, blob: blob is non-nil when
+-- Data had to be encoded to decide (and differed). It is never written: the write takes
+-- its own snapshot inside the transform.
 local function CheckAutoSave(profile): (boolean, buffer?)
 	local options = StoreOptions(profile)
 	if profile.last_write_clock == nil or SkipPossible(options) == false then
@@ -717,38 +729,21 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 			repeat_save_flag = false
 		end
 
-		-- [Anchor] Compact: one encode (also validates) + verify, taken now. The blob is
-		-- exactly what gets written, so it is also the skip baseline and LastSavedData.
-		-- (Data changed while the call is in flight is saved by the next save.)
-		local compact_blob = nil
+		-- [Anchor] Compact: one encode (also validates) + verify per transform run, taken
+		-- INSIDE the transform from the live Data table, at the same instant as the
+		-- bookkeeping (messages, MetaData.Anchor, ClearDirty), exactly where Compat and
+		-- stock take the live table. The blob is what gets written, so it is also the skip
+		-- baseline and LastSavedData.
 		local encode_problem = nil
 		local verify_problem = nil
 		-- Compat byte-compare mode: if this autosave already paid a compare encode (and
 		-- found a change), don't encode again for a new baseline; the next autosave then
 		-- writes without comparing and takes its baseline from that write. <= 1 encode per
 		-- autosave, never a skip against a baseline that isn't exactly what was written.
+		-- (A Compact skip-check blob is never written: Data may change before the transform.)
 		local compat_compare_paid = pre_blob ~= nil and options.Format ~= "Compact"
-		if options.Format == "Compact" then
-			local blob = pre_blob
-			pre_blob = nil
-			if blob == nil then
-				local ok, result_blob = pcall(Codec.encode, profile.Data)
-				if ok == true then
-					blob = result_blob
-				else
-					encode_problem = tostring(result_blob)
-				end
-			end
-			if blob ~= nil and options.VerifyWrites == true then
-				verify_problem = VerifyBlob(blob, profile.Data)
-				if verify_problem ~= nil then
-					blob = nil
-				end
-			end
-			compact_blob = blob
-		end
 		local skip_bookkeeping = SkipPossible(options)
-		pre_blob = nil -- a retry (release) takes a fresh snapshot
+		pre_blob = nil
 
 		local wrote = false
 		local written_blob = nil
@@ -768,6 +763,8 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 				written_blob = nil
 				compare_blob = nil
 				written_aux = nil
+				encode_problem = nil
+				verify_problem = nil
 
 				-- Check if this session still owns the profile:
 
@@ -819,6 +816,22 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 					if options.ClearDirty ~= nil and is_overwriting ~= true then
 						pcall(options.ClearDirty, profile)
 						cleared_hook_dirty = true
+					end
+
+					local compact_blob = nil
+					if options.Format == "Compact" then
+						local ok_enc, result_blob = pcall(Codec.encode, profile.Data)
+						if ok_enc == true then
+							compact_blob = result_blob
+						else
+							encode_problem = tostring(result_blob)
+						end
+						if compact_blob ~= nil and options.VerifyWrites == true then
+							verify_problem = VerifyBlob(compact_blob, profile.Data)
+							if verify_problem ~= nil then
+								compact_blob = nil
+							end
+						end
 					end
 
 					written_format = Envelope.writeData(latest_data, profile.Data, compact_blob, compact_blob ~= nil)
@@ -1719,7 +1732,7 @@ function ProfileStore:StartSessionAsync(profile_key, params)
 					-- Profile is now taken by this session:
 
 					-- [Anchor] decode the stored format before handing out a profile:
-					local ok_read, data, blob, read_error = Envelope.readData(loaded_data)
+					local ok_read, data, blob, read_error, stray = Envelope.readData(loaded_data)
 					if ok_read == false then
 						local message =
 							`Profile data could not be decoded ({tostring(read_error)}); session not started and data left untouched`
@@ -1730,6 +1743,7 @@ function ProfileStore:StartSessionAsync(profile_key, params)
 						return nil
 					end
 
+					ReportStrayKeys(self.Name, profile_key, stray)
 					local profile =
 						Profile.New(loaded_data, data, blob, key_info, self, profile_key, is_mock, session_token)
 					profile.last_write_clock = os.clock() -- the session-start write refreshed the lock
@@ -1963,13 +1977,14 @@ function ProfileStore:GetAsync(profile_key, version)
 			end
 
 			-- [Anchor]
-			local ok_read, data, blob, read_error = Envelope.readData(loaded_data)
+			local ok_read, data, blob, read_error, stray = Envelope.readData(loaded_data)
 			if ok_read == false then
 				local message = `Profile data could not be decoded ({tostring(read_error)})`
 				warn(`[{LIB}]: {message} (STORE:{self.Name}; KEY:{profile_key})`)
 				OnError:Fire(message, self.Name, profile_key)
 				return nil
 			end
+			ReportStrayKeys(self.Name, profile_key, stray)
 
 			local profile = Profile.New(loaded_data, data, blob, key_info, self, profile_key, is_mock)
 			profile.view_mode = true
