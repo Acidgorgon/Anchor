@@ -190,31 +190,32 @@ T.test("Profile.Data identity never changes across saves, messages and reconcile
 	end
 end)
 
-T.test("LastSavedData is decoded lazily and equals what was saved", function()
+T.test("LastSavedData: stock semantics in Compat, lazy blob in Compact, equals what was saved", function()
 	local s = Sim.newServer()
 	local A = boot(s)
 	for _, format in { "Compat", "Compact" } do
 		local store = A.New("PlayerData_" .. format, TEMPLATE, { Format = format })
 		local p = load(s, store, "Player_1")
-		T.eq(rawget(p, "LastSavedData"), nil, format .. ": not materialised at load")
+		-- Compat: stock's load deep copy. Compact: created from template, so a deep copy too.
 		T.deepEq(p.LastSavedData, TEMPLATE)
-		T.expect(rawget(p, "LastSavedData") ~= nil, "cached after first read")
 		T.expect(not rawequal(p.LastSavedData, p.Data), "a snapshot, not the live table")
 
 		p.Data.Coins = 11
 		table.insert(p.Data.Items, { Id = "Sword", Level = 3 })
 		T.eq(s:await(p.SaveAsync, p), true)
-		T.eq(rawget(p, "LastSavedData"), nil, format .. ": dropped after save until read")
+		if format == "Compact" then
+			T.eq(rawget(p, "LastSavedData"), nil, "Compact: blob, decoded on first read")
+		else
+			T.expect(rawget(p, "LastSavedData") ~= nil, "Compat: the table UpdateAsync returned")
+		end
 		local expected = { Coins = 11, Items = { { Id = "Sword", Level = 3 } }, Settings = { Music = true } }
 		T.deepEq(p.LastSavedData, expected)
 		p.Data.Coins = 12 -- unsaved change is not in LastSavedData
 		T.eq(p.LastSavedData.Coins, 11)
 
-		-- What is in the DataStore decodes to the same thing:
 		local got = s:await(store.GetAsync, store, "Player_1")
 		T.deepEq(got.Data, expected)
 
-		-- OnAfterSave still receives the snapshot:
 		local received
 		p.OnAfterSave:Connect(function(lsd)
 			received = lsd
@@ -223,6 +224,16 @@ T.test("LastSavedData is decoded lazily and equals what was saved", function()
 		Sim.advance(2)
 		T.eq(received and received.Coins, 12)
 		p:EndSession()
+		Sim.advance(2)
+
+		-- Loading a stored Compact profile keeps the stored buffer as LastSavedData.
+		local again = load(s, store, "Player_1")
+		if format == "Compact" then
+			T.eq(rawget(again, "LastSavedData"), nil, "Compact load: no copy made")
+			T.expect(again.lsd_blob ~= nil)
+		end
+		T.eq(again.LastSavedData.Coins, 12)
+		again:EndSession()
 		Sim.advance(2)
 	end
 end)
@@ -260,7 +271,7 @@ T.test("SaveAsync yields and reports whether the write landed", function()
 	T.eq(s:await(p.SaveAsync, p), false, "inactive profile")
 end)
 
-T.test("invalid data: OnError with path, no DataStore write, profile stays active", function()
+T.test("invalid data: the write fails like stock, its OnError names the path, profile stays active", function()
 	local s = Sim.newServer()
 	local A = boot(s)
 	A.SetConstant("AUTO_SAVE_PERIOD", 20)
@@ -273,16 +284,14 @@ T.test("invalid data: OnError with path, no DataStore write, profile stays activ
 	local callsBefore = s.stats.calls.UpdateAsync
 	p.Data.Items.Bad = function() end
 	T.eq(s:await(p.SaveAsync, p), false)
-	T.eq(s.stats.calls.UpdateAsync, callsBefore, "no DataStore call")
-	T.eq(#errors, 1)
+	T.eq(s.stats.calls.UpdateAsync, callsBefore + 1, "sent once, like stock")
+	T.eq(#errors, 1, "one OnError per failed call")
+	T.expect(string.find(errors[1][1], "[Anchor: ", 1, true), errors[1][1])
 	T.expect(string.find(errors[1][1], "Data.Items.Bad", 1, true), errors[1][1])
 	T.eq(errors[1][2], "PlayerData")
 	T.eq(errors[1][3], "Player_1")
 	T.expect(p:IsActive())
-
-	Sim.advance(60) -- autosaves keep being blocked, no calls
-	T.eq(s.stats.calls.UpdateAsync, callsBefore)
-	T.expect(not A.IsCriticalState, "validation failures don't count as DataStore errors")
+	T.eq(Sim.peek("PlayerData", "Player_1").Data.Coins, 0, "nothing written")
 
 	-- Fixing the data lets the next save through.
 	p.Data.Items.Bad = nil

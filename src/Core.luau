@@ -9,17 +9,20 @@
 
 	  * Data format: Compat (default, stock bytes) or Compact (Codec blob + poisoned
 	    stock counter, see Envelope.luau). Readers accept both.
-	  * LastSavedData is kept as a Codec blob and decoded lazily on first read.
-	  * Clean-save skip: an autosave whose encoded Data, UserIds, RobloxMetaData and
-	    MetaData.Anchor are byte-equal to the last successful write, with no processed
-	    messages to clear, is skipped while the last write is fresh enough that the
-	    lock can't look dead (see EffectiveLockRefresh). Manual saves, releases, forced
-	    saves and message pings are never skipped.
-	  * Pre-save validation: Data that a DataStore write would certainly reject is not
-	    sent (OnError fires, profile stays active, next cycle retries; releases retry).
-	    Data Codec can't encode but Roblox accepts is saved in the stock format.
-	  * Write verification (VerifyWrites, default on): every blob is decoded and
-	    deep-compared before it is used; on mismatch the save is written Compat.
+	  * Cost (SPEC section 9): Compat runs no Codec work on the happy path (stock-identical
+	    load copy and LastSavedData); Codec.validate runs only after a failed write, to put
+	    the bad path in that call's OnError message. Compact: one encode + one verify
+	    (decode + equal) per save; that blob is the write, the clean-skip baseline and
+	    the lazily decoded LastSavedData; load decodes once and keeps the stored buffer.
+	  * Clean-save skip, only when it can trigger (effective LockRefresh >= AUTO_SAVE_PERIOD):
+	    an autosave whose Data (IsDirty hook, or byte compare), UserIds, RobloxMetaData and
+	    MetaData.Anchor are unchanged since the last successful write, with no processed
+	    messages to clear, is skipped while the last write is fresh enough that the lock
+	    can't look dead. Manual saves, releases, forced saves and message pings are never
+	    skipped.
+	  * Write verification (VerifyWrites, default on) for Compact blobs; on mismatch the
+	    save is written Compat.
+	  * Same-server quick reload waits for this server's pending release of that key.
 	  * O(1) autosave list (circular doubly linked list with stock's cursor semantics).
 	  * Profile:SaveAsync(): yielding forced save -> true once a write that contains the
 	    current state succeeded while this session still owns the profile.
@@ -416,7 +419,15 @@ local function UpdateAsync(profile_store, profile_key, transform_params, is_user
 		return loaded_data, key_info
 	else
 		-- Error handling:
-		RegisterError(error_message or "Undefined error", profile_store.Name, profile_key)
+		local message = error_message or "Undefined error"
+		if transform_params.DescribeFailure ~= nil then
+			-- [Anchor] e.g. the path of the value the DataStore refused (validated only now)
+			local ok_detail, detail = pcall(transform_params.DescribeFailure)
+			if ok_detail == true and detail ~= nil then
+				message = `{tostring(message)} [Anchor: {detail}]`
+			end
+		end
+		RegisterError(message, profile_store.Name, profile_key)
 		-- Return nothing:
 		return nil
 	end
@@ -507,6 +518,10 @@ local function AutoSaveSnapshot()
 end
 
 -- [Anchor] Encoding helpers
+--
+-- Cost model (SPEC section 9): Compat adds no Luau work over stock on the happy path;
+-- Codec runs only when a clean-save skip can actually happen, or after a failed write
+-- (to name the bad path). Compact pays one encode + one verify (decode + equal) per save.
 
 local function StoreOptions(profile)
 	return profile.ProfileStore.anchor_options
@@ -516,112 +531,106 @@ local function EffectiveLockRefresh(options): number
 	return math.min(options.LockRefresh, ASSUME_DEAD * LOCK_REFRESH_DEAD_FRACTION - AUTO_SAVE_PERIOD)
 end
 
+-- A clean autosave can only be skipped if the lock-refresh window is at least one
+-- autosave period long; otherwise skip bookkeeping is never paid for.
+local function SkipPossible(options): boolean
+	return EffectiveLockRefresh(options) >= AUTO_SAVE_PERIOD
+end
+
 local function EncodeAux(profile): buffer
 	return Codec.encode({ u = profile.UserIds, r = profile.RobloxMetaData, a = profile.anchor_meta })
 end
 
--- Encodes (and verifies) `data`. Returns blob or nil, error message.
-local function EncodeVerified(data, verify: boolean): (buffer?, string?)
-	local ok, blob = pcall(Codec.encode, data)
-	if ok == false then
-		return nil, `Codec.encode failed: {tostring(blob)}`
+-- Verify = decode + deep-equal against the data the blob was encoded from.
+local function VerifyBlob(blob: buffer, data): string?
+	local ok_verify, same = pcall(function()
+		return Codec.equal(Codec.decode(blob), data)
+	end)
+	if ok_verify == false then
+		return `Codec verification errored: {tostring(same)}`
+	elseif same ~= true then
+		return "Codec verification mismatch (decoded blob differs from Data)"
 	end
-	if verify == true then
-		local ok_verify, same = pcall(function()
-			return Codec.equal(Codec.decode(blob), data)
-		end)
-		if ok_verify == false then
-			return nil, `Codec verification errored: {tostring(same)}`
-		elseif same ~= true then
-			return nil, "Codec verification mismatch (decoded blob differs from Data)"
-		end
-	end
-	return blob, nil
+	return nil
 end
 
--- LastSavedData bookkeeping: either a blob (decoded lazily) or a plain table (stock fallback).
-local function SetLastSaved(profile, blob, plain_table)
-	if blob ~= nil then
-		profile.saved_blob = blob
-		rawset(profile, "LastSavedData", nil)
-	else
-		profile.saved_blob = nil
-		rawset(profile, "LastSavedData", plain_table)
+-- Only called after a write failed: names the first value Codec rejects, if any.
+local function DescribeInvalid(data): string?
+	local ok, valid, path, reason = pcall(Codec.validate, data)
+	if ok == true and valid == false then
+		return `{tostring(reason)} at {tostring(path)}`
 	end
+	return nil
+end
+
+-- LastSavedData: either a plain table (stock semantics: deep copy at load, the table
+-- UpdateAsync returned after a save) or a stored Compact blob decoded on first read
+-- (profile.lsd_blob). Option LastSavedData = false keeps neither (always nil).
+local function SetLastSavedTable(profile, plain_table)
+	profile.lsd_blob = nil
+	if StoreOptions(profile).LastSavedData ~= false then
+		rawset(profile, "LastSavedData", plain_table)
+	else
+		rawset(profile, "LastSavedData", nil)
+	end
+end
+
+local function SetLastSavedBlob(profile, blob)
+	profile.lsd_blob = blob
+	rawset(profile, "LastSavedData", nil)
 end
 
 local function SetLastSavedFromRaw(profile, raw)
 	-- Data written by someone else (we didn't write in this call): read whatever format it is.
 	if Envelope.isCompactData(raw.Data) then
-		profile.saved_blob = raw.Data[Envelope.BLOB_KEY]
-		rawset(profile, "LastSavedData", nil)
+		SetLastSavedBlob(profile, raw.Data[Envelope.BLOB_KEY])
 	else
-		profile.saved_blob = nil
-		rawset(profile, "LastSavedData", raw.Data)
+		SetLastSavedTable(profile, raw.Data)
 	end
 end
 
 ----- Saving -----
 
--- [Anchor] Pre-save validation. Returns "ok" | "compat" (save plain, stock) | "block".
-local function PreSaveCheck(profile): string
-	local ok_call, valid, path, reason = pcall(Codec.validate, profile.Data)
-	if ok_call == true and valid == true then
-		return "ok"
-	end
-	local hard_path, hard_reason = Envelope.findHardInvalid(profile.Data)
-	if hard_path ~= nil then
-		ReportDataError(
-			profile,
-			`{hard_reason} (at {hard_path}); write not sent to the DataStore, profile stays active and will retry`,
-			"block"
-		)
-		return "block"
-	end
-	if ok_call == false then
-		path, reason = "Data", tostring(valid)
-	end
-	ReportDataError(
-		profile,
-		`Data is not Codec-encodable at {tostring(path)} ({tostring(reason)}); saving in the plain stock format`,
-		"compat",
-		true
-	)
-	return "compat"
-end
-
--- [Anchor] Clean-save skip decision for autosaves.
-local function CanSkipAutoSave(profile): boolean
+-- [Anchor] Clean-save skip decision for autosaves. Returns skip, blob: when Data had to be
+-- encoded to decide, the blob is returned so a Compact write can reuse it.
+local function CheckAutoSave(profile): (boolean, buffer?)
 	local options = StoreOptions(profile)
-	if profile.saved_blob == nil or profile.saved_aux == nil or profile.last_write_clock == nil then
-		return false
+	if profile.last_write_clock == nil or SkipPossible(options) == false then
+		return false, nil
 	end
-	local refresh = EffectiveLockRefresh(options)
-	if refresh <= 0 or os.clock() - profile.last_write_clock >= refresh then
-		return false -- the lock must be refreshed
+	if os.clock() - profile.last_write_clock >= EffectiveLockRefresh(options) then
+		return false, nil -- the lock must be refreshed
 	end
 	if next(profile.locked_global_updates) ~= nil then
-		return false -- processed messages must be cleared from the stored queue
+		return false, nil -- processed messages must be cleared from the stored queue
 	end
-	if profile.meta_dirty == true then
-		return false
+	if profile.meta_dirty == true or profile.saved_aux == nil then
+		return false, nil
 	end
 	local ok_aux, aux = pcall(EncodeAux, profile)
 	if ok_aux == false or Envelope.blobEqual(aux, profile.saved_aux) == false then
-		return false
+		return false, nil
 	end
 	local is_dirty = options.IsDirty
 	if is_dirty ~= nil and profile.hook_unsaved ~= true then
 		local ok_hook, dirty = pcall(is_dirty, profile)
 		if ok_hook == true and dirty == false then
-			return true
+			return true, nil
+		elseif ok_hook == true and dirty == true and options.Format ~= "Compact" then
+			return false, nil -- trust the hook; no compare encode
 		end
+	end
+	if profile.saved_blob == nil then
+		return false, nil
 	end
 	local ok, blob = pcall(Codec.encode, profile.Data)
 	if ok == false then
-		return false
+		return false, nil
 	end
-	return Envelope.blobEqual(blob, profile.saved_blob)
+	if Envelope.blobEqual(blob, profile.saved_blob) then
+		return true, nil
+	end
+	return false, blob
 end
 
 local function RunMessageHooks(profile, index, update_data): boolean
@@ -670,8 +679,11 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 	end
 
 	-- [Anchor] Clean-save skip (autosaves only):
+	local pre_blob = nil
 	if save_kind == "Auto" and is_ending_session ~= true and is_overwriting ~= true then
-		if CanSkipAutoSave(profile) == true then
+		local skip
+		skip, pre_blob = CheckAutoSave(profile)
+		if skip == true then
 			profile.skipped_saves += 1
 			return false
 		end
@@ -705,33 +717,57 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 			repeat_save_flag = false
 		end
 
-		-- [Anchor] Pre-save validation: never send what the DataStore would reject.
-		local check = PreSaveCheck(profile)
-
-		if check == "block" then
-			if repeat_save_flag == true then
-				task.wait(exp_backoff)
-				exp_backoff = math.min(if last_save_reason == "Shutdown" then 8 else 20, exp_backoff * 2)
-				continue
+		-- [Anchor] Compact: one encode (also validates) + verify, taken now. The blob is
+		-- exactly what gets written, so it is also the skip baseline and LastSavedData.
+		-- (Data changed while the call is in flight is saved by the next save.)
+		local compact_blob = nil
+		local encode_problem = nil
+		local verify_problem = nil
+		-- Compat byte-compare mode: if this autosave already paid a compare encode (and
+		-- found a change), don't encode again for a new baseline; the next autosave then
+		-- writes without comparing and takes its baseline from that write. <= 1 encode per
+		-- autosave, never a skip against a baseline that isn't exactly what was written.
+		local compat_compare_paid = pre_blob ~= nil and options.Format ~= "Compact"
+		if options.Format == "Compact" then
+			local blob = pre_blob
+			pre_blob = nil
+			if blob == nil then
+				local ok, result_blob = pcall(Codec.encode, profile.Data)
+				if ok == true then
+					blob = result_blob
+				else
+					encode_problem = tostring(result_blob)
+				end
 			end
-			break
+			if blob ~= nil and options.VerifyWrites == true then
+				verify_problem = VerifyBlob(blob, profile.Data)
+				if verify_problem ~= nil then
+					blob = nil
+				end
+			end
+			compact_blob = blob
 		end
+		local skip_bookkeeping = SkipPossible(options)
+		pre_blob = nil -- a retry (release) takes a fresh snapshot
 
 		local wrote = false
 		local written_blob = nil
+		local compare_blob = nil
 		local written_aux = nil
 		local written_format = nil
-		local encode_problem = nil
 		local cleared_hook_dirty = false
 
 		local loaded_data, key_info = UpdateAsync(profile.ProfileStore, profile.Key, {
 			ExistingProfileHandle = nil,
 			MissingProfileHandle = nil,
+			DescribeFailure = function()
+				return DescribeInvalid(profile.Data) -- [Anchor] only runs after a failed call
+			end,
 			EditProfile = function(latest_data)
 				wrote = false
 				written_blob = nil
+				compare_blob = nil
 				written_aux = nil
-				encode_problem = nil
 
 				-- Check if this session still owns the profile:
 
@@ -785,19 +821,24 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 						cleared_hook_dirty = true
 					end
 
-					local blob, problem = nil, nil
-					if check == "ok" then
-						blob, problem = EncodeVerified(profile.Data, options.VerifyWrites)
+					written_format = Envelope.writeData(latest_data, profile.Data, compact_blob, compact_blob ~= nil)
+					if written_format == "Compact" then
+						written_blob = compact_blob
+						compare_blob = compact_blob
+					elseif skip_bookkeeping == true and options.IsDirty == nil and compat_compare_paid == false then
+						-- Compat byte-compare baseline, only when a skip can happen: exactly
+						-- the Data being written (live table, serialized after this returns).
+						local ok_enc, blob = pcall(Codec.encode, profile.Data)
+						compare_blob = if ok_enc then blob else nil
 					end
-					encode_problem = problem
-					written_format = Envelope.writeData(latest_data, profile.Data, blob, options.Format == "Compact")
-					written_blob = blob
 
 					latest_data.RobloxMetaData = profile.RobloxMetaData
 					latest_data.UserIds = profile.UserIds
 
-					local ok_aux, aux = pcall(EncodeAux, profile)
-					written_aux = if ok_aux then aux else nil
+					if skip_bookkeeping == true then
+						local ok_aux, aux = pcall(EncodeAux, profile)
+						written_aux = if ok_aux then aux else nil
+					end
 
 					if is_overwriting ~= true then
 						latest_data.MetaData.LastUpdate = os.time()
@@ -815,8 +856,17 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 			end,
 		}, profile.is_mock)
 
-		if encode_problem ~= nil then
-			ReportDataError(profile, `{encode_problem}; this save was written in the plain stock format`, "encode")
+		if verify_problem ~= nil then
+			ReportDataError(profile, `{verify_problem}; this save was written in the plain stock format`, "verify")
+		elseif encode_problem ~= nil then
+			-- Codec rejects it: write it plain like stock; if the DataStore rejects it too,
+			-- that call's OnError names the path.
+			ReportDataError(
+				profile,
+				`Data is not Codec-encodable ({encode_problem}); saving in the plain stock format`,
+				"encode",
+				true
+			)
 		end
 
 		if cleared_hook_dirty == true and not (loaded_data ~= nil and key_info ~= nil and wrote == true) then
@@ -833,7 +883,12 @@ SaveProfileAsync = function(profile, is_ending_session, is_overwriting, last_sav
 				if cleared_hook_dirty == true then
 					profile.hook_unsaved = false
 				end
-				SetLastSaved(profile, written_blob, loaded_data.Data)
+				profile.saved_blob = compare_blob
+				if written_blob ~= nil then
+					SetLastSavedBlob(profile, written_blob)
+				else
+					SetLastSavedTable(profile, loaded_data.Data)
+				end
 				profile.written_format = written_format
 				if written_blob ~= nil then
 					local size = Envelope.estimateSize(written_blob, written_format == "Compact")
@@ -1044,9 +1099,9 @@ Profile.__index = function(self, key)
 		return method
 	end
 	if key == "LastSavedData" then
-		-- [Anchor] lazy decode of the last saved snapshot:
-		local blob = rawget(self, "saved_blob")
-		if blob ~= nil then
+		-- [Anchor] lazy decode of the last saved Compact blob:
+		local blob = rawget(self, "lsd_blob")
+		if blob ~= nil and self.ProfileStore.anchor_options.LastSavedData ~= false then
 			local ok, value = pcall(Codec.decode, blob)
 			if ok == true then
 				rawset(self, "LastSavedData", value)
@@ -1104,7 +1159,8 @@ function Profile.New(raw_data, data, blob, key_info, profile_store, key, is_mock
 		-- [Anchor]
 		anchor_meta = Envelope.readAnchorMeta(meta),
 		claimed_global_updates = {},
-		saved_blob = nil,
+		saved_blob = nil, -- blob of the last written Data, for the clean-save skip (or nil)
+		lsd_blob = nil, -- Compact blob LastSavedData is lazily decoded from (or nil)
 		saved_aux = nil,
 		last_write_clock = nil,
 		meta_dirty = false,
@@ -1114,19 +1170,21 @@ function Profile.New(raw_data, data, blob, key_info, profile_store, key, is_mock
 	}
 	setmetatable(self, Profile)
 
-	-- LastSavedData snapshot:
+	-- LastSavedData snapshot (SPEC section 9): a stored Compact blob is reused as is
+	-- (decoded on first read); plain data gets stock's deep copy, unless the store set
+	-- LastSavedData = false. No encode or verify on load.
 	local options = profile_store.anchor_options
-	if blob == nil then
-		blob = EncodeVerified(data, options.VerifyWrites)
-	end
 	if blob ~= nil then
-		self.saved_blob = blob
-	else
+		self.saved_blob = blob -- equals what's stored: the clean-skip baseline too
+		self.lsd_blob = blob
+	elseif options.LastSavedData ~= false then
 		rawset(self, "LastSavedData", DeepCopyTable(data)) -- stock
 	end
-	local ok_aux, aux = pcall(EncodeAux, self)
-	if ok_aux == true then
-		self.saved_aux = aux
+	if SkipPossible(options) then
+		local ok_aux, aux = pcall(EncodeAux, self)
+		if ok_aux == true then
+			self.saved_aux = aux
+		end
 	end
 
 	return self
@@ -1342,13 +1400,15 @@ local function ResolveOptions(options)
 		IsDirty = options.IsDirty,
 		ClearDirty = options.ClearDirty,
 		Mock = options.Mock == true, -- [Anchor] every call on this store uses the in-memory store
+		LastSavedData = options.LastSavedData ~= false, -- false: never keep profile.LastSavedData
 	}
 end
 
 -- [Anchor] third argument `options` is ours (stock ignores extra args):
 --   { Format = "Compat"|"Compact", VerifyWrites = true, LockRefresh = 300,
 --     IsDirty = fn(profile) -> boolean, ClearDirty = fn(profile),
---     Mock = false -- true: every call on this store uses the in-memory (store.Mock) store }
+--     Mock = false -- true: every call on this store uses the in-memory (store.Mock) store,
+--     LastSavedData = true -- false: skip the load deep copy; profile.LastSavedData stays nil }
 function ProfileStore.New(store_name, template, options)
 	template = template or {}
 

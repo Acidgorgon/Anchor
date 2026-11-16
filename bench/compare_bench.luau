@@ -552,11 +552,16 @@ if want("save") then
 	for _, ds in DATASETS do
 		local data = MAKERS[ds](1)
 		local callT, callA = calibrateCall(ds, data)
-		for _, lib in LIBS do
+		-- "no-skip" rows: LockRefresh 5 < period 10, so a clean skip can never trigger; this is
+		-- the code path every autosave takes at default constants (period 300).
+		local saveLibs = table.clone(LIBS)
+		table.insert(saveLibs, { name = "Anchor-Compat no-skip", format = "Compat", anchor = { LockRefresh = 5 } })
+		table.insert(saveLibs, { name = "Anchor-Compact no-skip", format = "Compact", anchor = { LockRefresh = 5 } })
+		for _, lib in saveLibs do
 			for _, kind in { "dirty", "clean" } do
 				newWorld(1)
 				local s = Sim.newServer({ JobId = "bench" })
-				local _, store = boot(s, lib, "Bench_" .. ds, TEMPLATES[ds], { period = 10 })
+				local _, store = boot(s, lib, "Bench_" .. ds, TEMPLATES[ds], { period = 10, anchor = lib.anchor })
 				Sim.advance(2)
 				seedProfile(s, store, "Player_1", data)
 				local p = s:await(store.StartSessionAsync, store, "Player_1")

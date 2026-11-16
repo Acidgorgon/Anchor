@@ -24,6 +24,7 @@
 	Options (third argument of Anchor.new):
 		Format = "Compat" (default) | "Compact", VerifyWrites = true, LockRefresh = 300,
 		IsDirty = fn(profile) -> boolean, ClearDirty = fn(profile),
+		LastSavedData = true                  -- false: no load copy; profile.LastSavedData stays nil
 		KeyPrefix = "Player_"                 -- Bind's key is KeyPrefix .. UserId
 
 		Dev options (Studio only; also settable as attributes on this ModuleScript, code wins):
