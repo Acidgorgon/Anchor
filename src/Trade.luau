@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-	Anchor / Trade - dupe-proof, loss-proof trades and gifts (docs/SPEC.md section 4).
+	Anchor / Trade - dupe-proof, loss-proof trades and gifts (docs/design/spec.md section 4).
 
 	USAGE
 		local ok, reason = Anchor.Trade(Data:Get(a), Data:Get(b), function(da, db)

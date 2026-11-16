@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-	Anchor / Receipts - exactly-once developer product grants (docs/SPEC.md section 4).
+	Anchor / Receipts - exactly-once developer product grants (docs/design/spec.md section 4).
 
 	USAGE (one line, for a store managed by Data:Bind()):
 		Data:HandleReceipts({
