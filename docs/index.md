@@ -31,6 +31,10 @@ features:
     details: The opt-in Compact format stores a 112 KB card collection in 39 KB. Old ProfileStore servers can't load a Compact profile, so they can never wipe it.
 ---
 
+::: tip Made with Claude
+Most of Anchor was written with [Claude](https://claude.ai), Anthropic's AI, to speed up my own Roblox workflow. Issues and pull requests are welcome.
+:::
+
 ## Quick start
 
 ::: code-group
